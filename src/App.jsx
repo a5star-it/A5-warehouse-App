@@ -2047,7 +2047,7 @@ function InboundHub({ setView, inboundRecords }) {
 /* ---------------------------------------------------------------
    INBOUND FLOW — shared by "new" and "return" types
 --------------------------------------------------------------- */
-function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInboundRecords, outboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast, setView }) {
+function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInboundRecords, outboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast, setView, isAdmin }) {
   const isNew = type === "new";
   const accent = isNew ? C.inboundNew : C.inboundReturn;
   const accentSoft = isNew ? C.inboundNewSoft : C.inboundReturnSoft;
