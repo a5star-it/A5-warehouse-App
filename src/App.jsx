@@ -2,13 +2,69 @@ import React, { useState, useEffect, useCallback, useRef } from "react";
 import * as XLSX from "xlsx";
 
 /* ---------------------------------------------------------------
+   Auth — a simple bearer-token session stored in localStorage.
+   authToken lives at module scope so the plain async helpers below
+   (kvGet/kvSet/extractFromFile/api*) can attach it without needing
+   to be React components themselves.
+--------------------------------------------------------------- */
+let authToken = null;
+function setAuthToken(t) {
+  authToken = t;
+}
+function authHeaders() {
+  return authToken ? { Authorization: `Bearer ${authToken}` } : {};
+}
+function notifyAuthExpired() {
+  window.dispatchEvent(new Event("wh-auth-expired"));
+}
+
+async function apiGet(path) {
+  const res = await fetch(path, { headers: authHeaders() });
+  if (res.status === 401) {
+    notifyAuthExpired();
+    throw new Error("session expired");
+  }
+  return res.json();
+}
+async function apiPost(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", ...authHeaders() },
+    body: JSON.stringify(body || {}),
+  });
+  if (res.status === 401) {
+    notifyAuthExpired();
+    throw new Error("session expired");
+  }
+  return res.json();
+}
+async function apiDelete(path) {
+  const res = await fetch(path, { method: "DELETE", headers: authHeaders() });
+  if (res.status === 401) {
+    notifyAuthExpired();
+    throw new Error("session expired");
+  }
+  return res.json();
+}
+
+// Fire-and-forget audit trail — failures here should never block the
+// action the person actually cares about.
+function logAudit(action, summary) {
+  apiPost("/api/audit-log", { action, summary }).catch(() => {});
+}
+
+/* ---------------------------------------------------------------
    Storage adapter — talks to our own Express + SQLite backend
    instead of the Claude-artifact window.storage API. Same call
    shape (throws on a missing key, mirroring window.storage.get's
    behavior) so the rest of the app needed no further changes.
 --------------------------------------------------------------- */
 async function kvGet(key) {
-  const res = await fetch(`/api/kv/${encodeURIComponent(key)}`);
+  const res = await fetch(`/api/kv/${encodeURIComponent(key)}`, { headers: authHeaders() });
+  if (res.status === 401) {
+    notifyAuthExpired();
+    throw new Error("session expired");
+  }
   if (!res.ok) throw new Error(`kv get failed: ${res.status}`);
   const data = await res.json();
   if (data.value == null) throw new Error("not found");
@@ -18,9 +74,13 @@ async function kvGet(key) {
 async function kvSet(key, value) {
   const res = await fetch(`/api/kv/${encodeURIComponent(key)}`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({ value }),
   });
+  if (res.status === 401) {
+    notifyAuthExpired();
+    return null;
+  }
   if (!res.ok) return null;
   return { ok: true };
 }
@@ -46,6 +106,8 @@ import {
   Users,
   ShoppingCart,
   Clock,
+  ShieldCheck,
+  History,
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -367,7 +429,7 @@ Cover every line item on the document as completely as possible. Do not include 
 
   const res = await fetch("/api/extract", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders() },
     body: JSON.stringify({
       model: "claude-sonnet-4-6",
       max_tokens: 1500,
@@ -379,6 +441,10 @@ Cover every line item on the document as completely as possible. Do not include 
       ],
     }),
   });
+  if (res.status === 401) {
+    notifyAuthExpired();
+    throw new Error("session expired");
+  }
   if (!res.ok) throw new Error("AI recognition request failed");
   const data = await res.json();
   const textBlocks = (data.content || [])
@@ -581,7 +647,92 @@ function UploadBox({ accent, accentSoft, label, hint, onFile, busy }) {
 /* ---------------------------------------------------------------
    HOME
 --------------------------------------------------------------- */
-function Home({ setView, inventory, inboundRecords, outboundRecords }) {
+function LoginScreen({ onLogin }) {
+  const [username, setUsername] = useState("");
+  const [password, setPassword] = useState("");
+  const [error, setError] = useState("");
+  const [busy, setBusy] = useState(false);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!username.trim() || !password) return;
+    setBusy(true);
+    setError("");
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ username: username.trim(), password }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || "Login failed");
+        return;
+      }
+      onLogin(data);
+    } catch (e) {
+      setError("Network error — please try again");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: C.bg, fontFamily: FONT_UI }}>
+      <form
+        onSubmit={submit}
+        style={{
+          background: C.surface,
+          padding: "32px 30px",
+          borderRadius: 6,
+          width: 320,
+          maxWidth: "90vw",
+          borderTop: `4px solid ${C.inventory}`,
+          boxShadow: "0 10px 30px rgba(0,0,0,0.10)",
+        }}
+      >
+        <div style={{ fontSize: 12.5, letterSpacing: "0.08em", color: C.amber, fontWeight: 700, fontFamily: FONT_MONO, marginBottom: 4 }}>
+          A5 STAR
+        </div>
+        <div style={{ fontSize: 19, fontWeight: 700, color: C.ink, marginBottom: 22 }}>Sign in</div>
+        <Field label="Username">
+          <input value={username} onChange={(e) => setUsername(e.target.value)} style={inputStyle} autoFocus />
+        </Field>
+        <Field label="Password">
+          <input type="password" value={password} onChange={(e) => setPassword(e.target.value)} style={inputStyle} />
+        </Field>
+        {error && (
+          <div style={{ color: C.danger, fontSize: 12.5, fontFamily: FONT_UI, marginBottom: 12, display: "flex", gap: 6, alignItems: "center" }}>
+            <AlertTriangle size={13} />
+            {error}
+          </div>
+        )}
+        <button
+          type="submit"
+          disabled={busy}
+          style={{
+            width: "100%",
+            marginTop: 4,
+            padding: "10px 16px",
+            borderRadius: 4,
+            border: "none",
+            background: C.inventory,
+            color: "#fff",
+            fontWeight: 700,
+            fontSize: 14,
+            fontFamily: FONT_UI,
+            cursor: busy ? "not-allowed" : "pointer",
+            opacity: busy ? 0.6 : 1,
+          }}
+        >
+          {busy ? "Signing in…" : "Sign in"}
+        </button>
+      </form>
+    </div>
+  );
+}
+
+function Home({ setView, inventory, inboundRecords, outboundRecords, auth, onLogout }) {
   const totalNew = inventory.reduce((s, x) => s + (x.qtyNew || 0), 0);
   const totalReturn = inventory.reduce((s, x) => s + (x.qtyReturn || 0), 0);
   const thisMonth = new Date().toISOString().slice(0, 7);
@@ -614,12 +765,35 @@ function Home({ setView, inventory, inboundRecords, outboundRecords }) {
       stat: `${outboundThisMonth} shipments this month`,
     },
   ];
+  if (auth?.role === "admin") {
+    cards.push({
+      key: "admin",
+      title: "Admin",
+      desc: "Manage team accounts and view the audit log",
+      accent: C.amber,
+      icon: ShieldCheck,
+      stat: "Admin only",
+    });
+  }
 
   return (
     <div>
       <div style={{ background: C.bgHeader, color: C.headerInk, padding: "26px 24px 22px" }}>
-        <div style={{ fontSize: 13, letterSpacing: "0.08em", color: C.amber, fontWeight: 700, fontFamily: FONT_MONO }}>
-          A5 STAR · WAREHOUSE LEDGER
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+          <div style={{ fontSize: 13, letterSpacing: "0.08em", color: C.amber, fontWeight: 700, fontFamily: FONT_MONO }}>
+            A5 STAR · WAREHOUSE LEDGER
+          </div>
+          <div style={{ fontSize: 12, color: "rgba(237,238,233,0.75)", fontFamily: FONT_UI, textAlign: "right" }}>
+            <div>
+              {auth?.username} <span style={{ color: "rgba(237,238,233,0.5)" }}>({auth?.role})</span>
+            </div>
+            <button
+              onClick={onLogout}
+              style={{ background: "none", border: "none", color: C.amber, cursor: "pointer", fontSize: 12, fontFamily: FONT_UI, padding: 0, marginTop: 2 }}
+            >
+              Log out
+            </button>
+          </div>
         </div>
         <div style={{ fontSize: 22, fontWeight: 700, marginTop: 6, fontFamily: FONT_UI }}>Inbound / Outbound Management</div>
         <div style={{ fontSize: 12.5, color: "rgba(237,238,233,0.6)", marginTop: 4, fontFamily: FONT_MONO, display: "flex", alignItems: "center", gap: 6 }}>
@@ -668,7 +842,7 @@ function Home({ setView, inventory, inboundRecords, outboundRecords }) {
 /* ---------------------------------------------------------------
    INVENTORY VIEW
 --------------------------------------------------------------- */
-function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap, saveAliasMap, ignoredSkus, saveIgnoredSkus, inboundRecords, outboundRecords }) {
+function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap, saveAliasMap, ignoredSkus, saveIgnoredSkus, inboundRecords, outboundRecords, isAdmin }) {
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState(null); // sku or 'new'
   const [form, setForm] = useState({ sku: "", name: "", qtyNew: 0, qtyReturn: 0 });
@@ -707,12 +881,14 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
     if (idx >= 0) next[idx] = record;
     else next.push(record);
     saveInventory(next);
+    logAudit("inventory-adjust", `Set ${record.sku} to New=${record.qtyNew}, Return=${record.qtyReturn}`);
     setEditing(null);
     showToast("Inventory updated");
   };
 
   const removeItem = (sku) => {
     saveInventory(inventory.filter((x) => x.sku !== sku));
+    logAudit("inventory-delete", `Deleted inventory item ${sku}`);
     showToast("Item deleted");
   };
 
@@ -798,9 +974,11 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
           <Btn onClick={() => setShowIgnored(true)} color={C.inkSoft} variant="outline" icon={X}>
             Ignored Codes
           </Btn>
-          <Btn onClick={() => setShowInsights(true)} color={C.inventory} variant="outline" icon={ShoppingCart}>
-            Restock Insights
-          </Btn>
+          {isAdmin && (
+            <Btn onClick={() => setShowInsights(true)} color={C.inventory} variant="outline" icon={ShoppingCart}>
+              Restock Insights
+            </Btn>
+          )}
           <Btn
             onClick={() => {
               const rows = [
@@ -859,7 +1037,9 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
         </Modal>
       )}
 
-      {showAliases && <AliasManager aliasMap={aliasMap} saveAliasMap={saveAliasMap} inventory={inventory} onClose={() => setShowAliases(false)} />}
+      {showAliases && (
+        <AliasManager aliasMap={aliasMap} saveAliasMap={saveAliasMap} inventory={inventory} isAdmin={isAdmin} onClose={() => setShowAliases(false)} />
+      )}
       {showIgnored && <IgnoredSkuManager ignoredSkus={ignoredSkus} saveIgnoredSkus={saveIgnoredSkus} onClose={() => setShowIgnored(false)} />}
       {showInsights && (
         <InsightsModal inventory={inventory} inboundRecords={inboundRecords} outboundRecords={outboundRecords} onClose={() => setShowInsights(false)} />
@@ -868,16 +1048,18 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
   );
 }
 
-function AliasManager({ aliasMap, saveAliasMap, inventory, onClose }) {
+function AliasManager({ aliasMap, saveAliasMap, inventory, isAdmin, onClose }) {
   const entries = Object.entries(aliasMap || {});
   const [showAdd, setShowAdd] = useState(false);
   const [rawInput, setRawInput] = useState("");
   const [components, setComponents] = useState([{ sku: "", qty: 1 }]);
 
   const remove = (key) => {
+    const raw = aliasMap[key]?.raw || key;
     const next = { ...aliasMap };
     delete next[key];
     saveAliasMap(next);
+    logAudit("alias-delete", `Removed SKU mapping rule for "${raw}"`);
   };
   const exportCSV = () => {
     const rows = [["Raw SKU", "Maps to SKU", "Qty"]];
@@ -897,6 +1079,7 @@ function AliasManager({ aliasMap, saveAliasMap, inventory, onClose }) {
     const comps = components.map((c) => ({ sku: String(c.sku || "").trim(), qty: Number(c.qty) || 1 })).filter((c) => c.sku);
     if (comps.length === 0) return;
     saveAliasMap({ ...aliasMap, [normalizeSku(raw)]: { raw, components: comps } });
+    logAudit("alias-add", `Added SKU mapping rule: "${raw}" → ${comps.map((c) => `${c.sku} ×${c.qty}`).join(", ")}`);
     setRawInput("");
     setComponents([{ sku: "", qty: 1 }]);
     setShowAdd(false);
@@ -1017,9 +1200,11 @@ function AliasManager({ aliasMap, saveAliasMap, inventory, onClose }) {
       )}
 
       <div style={{ display: "flex", justifyContent: "flex-end" }}>
-        <Btn color={C.inventory} icon={Download} onClick={exportCSV} disabled={entries.length === 0}>
-          Export CSV
-        </Btn>
+        {isAdmin && (
+          <Btn color={C.inventory} icon={Download} onClick={exportCSV} disabled={entries.length === 0}>
+            Export CSV
+          </Btn>
+        )}
       </div>
     </Modal>
   );
@@ -1170,10 +1355,12 @@ function IgnoredSkuManager({ ignoredSkus, saveIgnoredSkus, onClose }) {
       return;
     }
     saveIgnoredSkus([...ignoredSkus, val]);
+    logAudit("ignored-add", `Added ignored code "${val}"`);
     setInput("");
   };
   const remove = (val) => {
     saveIgnoredSkus(ignoredSkus.filter((s) => s !== val));
+    logAudit("ignored-delete", `Removed ignored code "${val}"`);
   };
   return (
     <Modal title="Ignored Codes" accent={C.inventory} onClose={onClose}>
@@ -2027,6 +2214,10 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
       type,
     };
     saveInboundRecords([record, ...inboundRecords]);
+    logAudit(
+      isNew ? "inbound-new-confirm" : "inbound-return-confirm",
+      `${isNew ? "New stock purchase" : "Return stock inbound"} confirmed: ${cleanItems.length} item rows from "${draft.fileName}" (${record.supplier})`
+    );
     setDraft(null);
     showToast(isNew ? "Purchase confirmed, inventory updated" : "Return inbound confirmed, inventory updated");
   };
@@ -2084,9 +2275,11 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
 
         <div style={{ marginTop: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div style={{ fontSize: 13.5, fontWeight: 700, fontFamily: FONT_UI, color: C.ink }}>Recent records</div>
-          <Btn color={C.amber} icon={Download} onClick={() => setShowReport(true)}>
-            Generate Monthly Report
-          </Btn>
+          {isAdmin && (
+            <Btn color={C.amber} icon={Download} onClick={() => setShowReport(true)}>
+              Generate Monthly Report
+            </Btn>
+          )}
         </div>
         <RecordsList records={typeRecords} dateField="invoiceDate" showAmount />
       </div>
@@ -2186,7 +2379,7 @@ function OutboundHub({ setView, outboundRecords }) {
 /* ---------------------------------------------------------------
    OUTBOUND — Amazon FBA Shipment
 --------------------------------------------------------------- */
-function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, saveOutboundRecords, inboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast }) {
+function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, saveOutboundRecords, inboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast, isAdmin }) {
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState(null); // + shipmentId, shipmentName, boxes
   const [excelPending, setExcelPending] = useState(null);
@@ -2356,6 +2549,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
       type: "fba",
     };
     saveOutboundRecords([record, ...outboundRecords]);
+    logAudit("outbound-fba-confirm", `FBA shipment ${record.shipmentId} confirmed: ${cleanItems.length} item rows, ${record.boxes} boxes`);
     setDraft(null);
     showToast(shortage ? "Shipment confirmed, but some items are now negative — please check" : "Shipment confirmed, inventory updated", shortage ? "error" : "success");
   };
@@ -2414,9 +2608,11 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
 
         <div style={{ marginTop: 20, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
           <div style={{ fontSize: 13.5, fontWeight: 700, fontFamily: FONT_UI, color: C.ink }}>Recent shipments</div>
-          <Btn color={C.amber} icon={Download} onClick={() => setShowReport(true)}>
-            Generate Monthly Report
-          </Btn>
+          {isAdmin && (
+            <Btn color={C.amber} icon={Download} onClick={() => setShowReport(true)}>
+              Generate Monthly Report
+            </Btn>
+          )}
         </div>
         <RecordsList records={typeRecords} dateField="shipDate" sourceLabel={(r) => `${r.boxes || 0} boxes`} />
       </div>
@@ -2738,6 +2934,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
       type: "order",
     };
     saveOutboundRecords([record, ...outboundRecords]);
+    logAudit("outbound-order-confirm", `Order fulfillment confirmed: ${cleanItems.length} item rows from "${draft.fileName}" (${record.platform})`);
     setDraft(null);
     showToast(shortage ? "Outbound confirmed, but some items are now negative — please check" : "Outbound confirmed, inventory updated", shortage ? "error" : "success");
   };
@@ -2822,9 +3019,183 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
 }
 
 /* ---------------------------------------------------------------
+   ADMIN — team accounts + audit log
+--------------------------------------------------------------- */
+function AdminView({ setView, auth }) {
+  const [users, setUsersList] = useState([]);
+  const [auditLog, setAuditLog] = useState([]);
+  const [loadingUsers, setLoadingUsers] = useState(true);
+  const [loadingAudit, setLoadingAudit] = useState(true);
+  const [showAddUser, setShowAddUser] = useState(false);
+  const [newUsername, setNewUsername] = useState("");
+  const [newPassword, setNewPassword] = useState("");
+  const [newRole, setNewRole] = useState("guest");
+  const [error, setError] = useState("");
+
+  const loadUsers = async () => {
+    setLoadingUsers(true);
+    try {
+      const data = await apiGet("/api/users");
+      setUsersList(data.users || []);
+    } catch (e) {}
+    setLoadingUsers(false);
+  };
+  const loadAudit = async () => {
+    setLoadingAudit(true);
+    try {
+      const data = await apiGet("/api/audit-log");
+      setAuditLog(data.entries || []);
+    } catch (e) {}
+    setLoadingAudit(false);
+  };
+
+  useEffect(() => {
+    loadUsers();
+    loadAudit();
+  }, []);
+
+  const addUser = async () => {
+    setError("");
+    if (!newUsername.trim() || !newPassword) {
+      setError("Username and password are required");
+      return;
+    }
+    const data = await apiPost("/api/users", { username: newUsername.trim(), password: newPassword, role: newRole });
+    if (data.error) {
+      setError(data.error);
+      return;
+    }
+    setNewUsername("");
+    setNewPassword("");
+    setNewRole("guest");
+    setShowAddUser(false);
+    loadUsers();
+    loadAudit();
+  };
+
+  const removeUser = async (username) => {
+    const data = await apiDelete(`/api/users/${encodeURIComponent(username)}`);
+    if (data.error) {
+      setError(data.error);
+      return;
+    }
+    loadUsers();
+    loadAudit();
+  };
+
+  return (
+    <div>
+      <TopBar title="Admin" subtitle="Team accounts and audit log" onBack={() => setView("home")} accent={C.amber} />
+      <div style={{ padding: 18 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <ShieldCheck size={16} color={C.amber} />
+          <div style={{ fontSize: 14, fontWeight: 700, fontFamily: FONT_UI, color: C.ink }}>Team accounts</div>
+          <Btn color={C.amber} icon={Plus} onClick={() => setShowAddUser(true)} style={{ marginLeft: "auto", fontSize: 12.5, padding: "6px 10px" }}>
+            Add account
+          </Btn>
+        </div>
+        {loadingUsers ? (
+          <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>Loading…</div>
+        ) : (
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, overflow: "hidden", marginBottom: 24 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1.3fr 0.8fr 1fr 30px", padding: "8px 12px", background: C.surfaceSoft, fontSize: 11.5, fontWeight: 700, color: C.inkSoft, fontFamily: FONT_UI }}>
+              <div>Username</div>
+              <div>Role</div>
+              <div>Created</div>
+              <div></div>
+            </div>
+            {users.map((u) => (
+              <div
+                key={u.username}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1.3fr 0.8fr 1fr 30px",
+                  padding: "7px 12px",
+                  borderTop: `1px solid ${C.surfaceSoft}`,
+                  fontSize: 12.5,
+                  fontFamily: FONT_UI,
+                  alignItems: "center",
+                }}
+              >
+                <div style={{ fontFamily: FONT_MONO }}>{u.username}</div>
+                <div>
+                  <Stamp label={u.role} color={u.role === "admin" ? C.amber : C.inkSoft} bg={C.surface} />
+                </div>
+                <div style={{ color: C.inkSoft, fontFamily: FONT_MONO }}>{(u.createdAt || "").slice(0, 10)}</div>
+                {u.username !== auth.username && (
+                  <button onClick={() => removeUser(u.username)} style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft }}>
+                    <Trash2 size={13} />
+                  </button>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
+        {error && <div style={{ color: C.danger, fontSize: 12.5, fontFamily: FONT_UI, marginTop: -14, marginBottom: 14 }}>{error}</div>}
+
+        <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+          <History size={16} color={C.amber} />
+          <div style={{ fontSize: 14, fontWeight: 700, fontFamily: FONT_UI, color: C.ink }}>Audit log</div>
+          <Btn variant="outline" color={C.inkSoft} onClick={loadAudit} style={{ marginLeft: "auto", fontSize: 12, padding: "5px 9px" }}>
+            Refresh
+          </Btn>
+        </div>
+        {loadingAudit ? (
+          <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>Loading…</div>
+        ) : auditLog.length === 0 ? (
+          <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>No activity recorded yet.</div>
+        ) : (
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, maxHeight: 420, overflowY: "auto" }}>
+            {auditLog.map((e) => (
+              <div key={e.id} style={{ padding: "9px 12px", borderTop: `1px solid ${C.surfaceSoft}`, fontSize: 12.5, fontFamily: FONT_UI }}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 10 }}>
+                  <span style={{ fontWeight: 700, color: C.ink }}>{e.username}</span>
+                  <span style={{ fontFamily: FONT_MONO, color: C.inkSoft, fontSize: 11.5, whiteSpace: "nowrap" }}>
+                    {new Date(e.timestamp).toLocaleString()}
+                  </span>
+                </div>
+                <div style={{ color: C.inkSoft, marginTop: 2 }}>{e.summary}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+
+      {showAddUser && (
+        <Modal title="Add team account" accent={C.amber} onClose={() => setShowAddUser(false)}>
+          <Field label="Username">
+            <input value={newUsername} onChange={(e) => setNewUsername(e.target.value)} style={inputStyle} />
+          </Field>
+          <Field label="Password">
+            <input type="password" value={newPassword} onChange={(e) => setNewPassword(e.target.value)} style={inputStyle} />
+          </Field>
+          <Field label="Role">
+            <select value={newRole} onChange={(e) => setNewRole(e.target.value)} style={inputStyle}>
+              <option value="guest">Guest — full app access, inventory-level export only</option>
+              <option value="admin">Admin — full access including all reports</option>
+            </select>
+          </Field>
+          {error && <div style={{ color: C.danger, fontSize: 12.5, marginBottom: 10 }}>{error}</div>}
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 10 }}>
+            <Btn variant="outline" color={C.inkSoft} onClick={() => setShowAddUser(false)}>
+              Cancel
+            </Btn>
+            <Btn color={C.amber} onClick={addUser}>
+              Create account
+            </Btn>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
+/* ---------------------------------------------------------------
    ROOT APP
 --------------------------------------------------------------- */
 export default function WarehouseApp() {
+  const [auth, setAuth] = useState(null);
+  const [authChecked, setAuthChecked] = useState(false);
   const [view, setView] = useState("home");
   const [loaded, setLoaded] = useState(false);
   const [inventory, setInventory] = useState([]);
@@ -2839,9 +3210,48 @@ export default function WarehouseApp() {
     setTimeout(() => setToast(null), 3000);
   }, []);
 
-  // All data is stored SHARED — anyone who opens this same artifact reads
-  // and writes the same inventory, records, and SKU mapping rules.
+  const handleLogin = useCallback((data) => {
+    setAuthToken(data.token);
+    const authObj = { token: data.token, username: data.username, role: data.role };
+    localStorage.setItem("wh-auth", JSON.stringify(authObj));
+    setLoaded(false);
+    setView("home");
+    setAuth(authObj);
+  }, []);
+
+  const handleLogout = useCallback(() => {
+    apiPost("/api/auth/logout", {}).catch(() => {});
+    localStorage.removeItem("wh-auth");
+    setAuthToken(null);
+    setAuth(null);
+  }, []);
+
+  // Restore a saved session on load, and log out automatically if the
+  // server ever rejects a request as unauthenticated (expired/deleted session).
   useEffect(() => {
+    try {
+      const stored = localStorage.getItem("wh-auth");
+      if (stored) {
+        const parsed = JSON.parse(stored);
+        setAuthToken(parsed.token);
+        setAuth(parsed);
+      }
+    } catch (e) {}
+    setAuthChecked(true);
+
+    const onExpired = () => {
+      localStorage.removeItem("wh-auth");
+      setAuthToken(null);
+      setAuth(null);
+    };
+    window.addEventListener("wh-auth-expired", onExpired);
+    return () => window.removeEventListener("wh-auth-expired", onExpired);
+  }, []);
+
+  // All data is shared across your team — anyone signed in reads and
+  // writes the same inventory, records, and SKU mapping rules.
+  useEffect(() => {
+    if (!auth) return;
     (async () => {
       try {
         const inv = await kvGet("inventory").catch(() => null);
@@ -2872,7 +3282,7 @@ export default function WarehouseApp() {
       } catch (e) {}
       setLoaded(true);
     })();
-  }, []);
+  }, [auth]);
 
   const saveInventory = useCallback(async (next) => {
     setInventory(next);
@@ -2924,15 +3334,37 @@ export default function WarehouseApp() {
     }
   }, [showToast]);
 
+  const globalStyle = (
+    <style>{`
+      @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
+      * { box-sizing: border-box; }
+      input:focus, select:focus { border-color: ${C.inventory} !important; }
+      ::-webkit-scrollbar { width: 8px; height: 8px; }
+      ::-webkit-scrollbar-thumb { background: ${C.borderStrong}; border-radius: 4px; }
+    `}</style>
+  );
+
+  if (!authChecked) {
+    return (
+      <div style={{ fontFamily: FONT_UI, background: C.bg, minHeight: "100vh" }}>
+        {globalStyle}
+      </div>
+    );
+  }
+  if (!auth) {
+    return (
+      <div style={{ fontFamily: FONT_UI, background: C.bg, minHeight: "100vh" }}>
+        {globalStyle}
+        <LoginScreen onLogin={handleLogin} />
+      </div>
+    );
+  }
+
+  const isAdmin = auth.role === "admin";
+
   return (
     <div style={{ fontFamily: FONT_UI, background: C.bg, minHeight: "100%", color: C.ink }}>
-      <style>{`
-        @keyframes spin { from { transform: rotate(0deg); } to { transform: rotate(360deg); } }
-        * { box-sizing: border-box; }
-        input:focus, select:focus { border-color: ${C.inventory} !important; }
-        ::-webkit-scrollbar { width: 8px; height: 8px; }
-        ::-webkit-scrollbar-thumb { background: ${C.borderStrong}; border-radius: 4px; }
-      `}</style>
+      {globalStyle}
 
       {!loaded ? (
         <div style={{ padding: 60, textAlign: "center", color: C.inkSoft }}>
@@ -2940,7 +3372,14 @@ export default function WarehouseApp() {
           <div style={{ marginTop: 10, fontSize: 13 }}>Loading…</div>
         </div>
       ) : view === "home" ? (
-        <Home setView={setView} inventory={inventory} inboundRecords={inboundRecords} outboundRecords={outboundRecords} />
+        <Home
+          setView={setView}
+          inventory={inventory}
+          inboundRecords={inboundRecords}
+          outboundRecords={outboundRecords}
+          auth={auth}
+          onLogout={handleLogout}
+        />
       ) : view === "inventory" ? (
         <InventoryView
           setView={setView}
@@ -2953,6 +3392,7 @@ export default function WarehouseApp() {
           saveIgnoredSkus={saveIgnoredSkus}
           inboundRecords={inboundRecords}
           outboundRecords={outboundRecords}
+          isAdmin={isAdmin}
         />
       ) : view === "inbound" ? (
         <InboundHub setView={setView} inboundRecords={inboundRecords} />
@@ -2969,6 +3409,7 @@ export default function WarehouseApp() {
           ignoredSkus={ignoredSkus}
           showToast={showToast}
           setView={setView}
+          isAdmin={isAdmin}
         />
       ) : view === "outbound" ? (
         <OutboundHub setView={setView} outboundRecords={outboundRecords} />
@@ -2984,8 +3425,9 @@ export default function WarehouseApp() {
           saveAliasMap={saveAliasMap}
           ignoredSkus={ignoredSkus}
           showToast={showToast}
+          isAdmin={isAdmin}
         />
-      ) : (
+      ) : view === "outbound-order" ? (
         <OutboundOrderFlow
           setView={setView}
           inventory={inventory}
@@ -2997,6 +3439,17 @@ export default function WarehouseApp() {
           saveAliasMap={saveAliasMap}
           ignoredSkus={ignoredSkus}
           showToast={showToast}
+        />
+      ) : view === "admin" && isAdmin ? (
+        <AdminView setView={setView} auth={auth} />
+      ) : (
+        <Home
+          setView={setView}
+          inventory={inventory}
+          inboundRecords={inboundRecords}
+          outboundRecords={outboundRecords}
+          auth={auth}
+          onLogout={handleLogout}
         />
       )}
 
