@@ -415,7 +415,7 @@ async function extractFromFile(file, mode) {
   ],
   "total_amount": total amount as a number, or the sum of item amounts if not stated
 }
-Cover every line item on the document as completely as possible. Do not include shipping charges, service fees, taxes, or other non-product lines — only physical products.`;
+Cover every line item on the document as completely as possible. Do not include shipping charges, service fees, taxes, or other non-product lines — only physical products. Some invoices have a warehouse location / shelf / bin column (often labeled "Place", "Ubicazione", "Location", or similar) sitting right next to the actual product code column (often labeled "Codice", "SKU", "Cod.", "Item code", or similar) — these are two separate pieces of information, even when they appear visually adjacent or on the same line. Use ONLY the product code column for sku_guess; never prepend, append, or merge a location/shelf/bin code into the SKU.`;
 
   const promptOutbound = `You are a warehouse assistant. Carefully read this shipping / outbound document (courier label, platform packing list, shipment manifest, etc. — image or PDF) and extract the following information. Return ONLY a JSON object — no other text, explanation, or markdown code fences. Format:
 {
