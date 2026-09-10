@@ -12,9 +12,16 @@ Railway and shared with your whole team at one URL.
 - **AI invoice/document recognition**: now calls Anthropic's API using
   **your own API key**, kept only on the server (`ANTHROPIC_API_KEY`
   environment variable) — the browser never sees it.
-- **No login screen** — anyone with the URL can use and edit the data.
-  Good enough for an internal team tool on a private URL; see
-  "Locking it down later" below if you want more.
+- **Login required, with roles**: there's now a sign-in screen. Two roles:
+  - **admin** — full access, including downloading every report (monthly
+    purchase reports, FBA shipment reports, SKU mapping rules, Restock
+    Insights) and the Admin panel (manage accounts, view the audit log).
+  - **guest** — full day-to-day access (inventory, inbound, outbound,
+    SKU mapping) but can only download the plain current-inventory CSV;
+    every other report/export button is hidden.
+  - Every inventory change, inbound/outbound confirmation, and SKU
+    mapping/ignored-code edit is written to an **audit log** admins can
+    view under Admin → Audit log, showing who did what and when.
 
 Everything else — the SKU mapping rules, the FBA shipment parsing, the
 Amazon packing-slip parsing, the monthly reports, Restock Insights — is the
@@ -69,13 +76,26 @@ first.
 4. **Set environment variables:** open the service → **Variables** tab →
    add:
    - `ANTHROPIC_API_KEY` = the key from step 1
+   - `ADMIN_USERNAME` = whatever username you want for the first admin
+     account (e.g. `admin`)
+   - `ADMIN_PASSWORD` = a real password for it — pick something you
+     wouldn't mind a teammate guessing, since this account can do
+     everything, including deleting other accounts
    - (leave `PORT` and `DATA_FILE` alone — Railway and the volume step
      above already handle those)
+
+   These two account variables only matter on the **very first boot** —
+   they create the initial admin account once, then the server ignores
+   them. To change that account's password later, delete it from the
+   Admin panel (if you have another admin) or create a new admin account
+   from the app and use that one going forward.
 5. **Get a public URL:** service → **Settings → Networking → Generate
    Domain**. Railway gives you a `*.up.railway.app` address — that's the
    link you share with your team.
-6. Open the link. You should see the same three cards (Inventory / Inbound
-   / Outbound) as before.
+6. Open the link, sign in with the admin username/password from step 4.
+   From **Admin** on the home screen, add an account for each teammate —
+   role `guest` for normal day-to-day use, `admin` only for people who
+   should see every report and manage accounts.
 
 Every future change: push updated code to the same GitHub repo, and
 Railway redeploys automatically.
@@ -107,17 +127,25 @@ then open `http://localhost:3000`.
 
 ---
 
-## Locking it down later
+## Locking it down further
 
-Right now, anyone with the URL can open and edit everything — same as the
-shared Claude artifact. If later you want to restrict it to your team
-only, a few options, roughly easiest → most robust:
+There's now a real login with two roles (admin/guest) and an audit log —
+covers "who can see what" and "who did what." A few things it does **not**
+cover, worth knowing:
 
-- Don't publish the URL anywhere public; treat it like an unlisted link.
-- Put it behind your office/company VPN or a Railway private network.
-- Add simple shared-password protection (a small code change — ask me and
-  I can add it).
-- A real login system with per-person accounts (a bigger change).
+- No password reset flow or email verification — if someone forgets a
+  password, an admin deletes their account and creates a fresh one.
+- No account lockout after repeated failed logins (no rate limiting).
+- Sessions last 30 days and live in the same JSON file as everything
+  else — if you want people to be forced to re-login sooner, that's a
+  small code change (ask me).
+- Treat the URL itself as something to not publish anywhere public —
+  the login screen is the real gate, but there's no reason to make it
+  easy to find either.
+
+For a small internal team this is a reasonable level of security. If you
+outgrow it — many admins, compliance requirements, SSO — that's a bigger
+change (ask me when you get there).
 
 ## Costs to expect
 
@@ -136,5 +164,8 @@ only, a few options, roughly easiest → most robust:
   from the running server — useful if the app loads but a feature (like
   AI extraction) fails.
 - Common first-deploy issues: forgot to add `ANTHROPIC_API_KEY` (AI
-  extraction will fail with a clear server error), or forgot the volume
-  (data disappears after a redeploy).
+  extraction will fail with a clear server error), forgot the volume
+  (data disappears after a redeploy), or forgot `ADMIN_USERNAME`/
+  `ADMIN_PASSWORD` on the very first boot (nobody can log in — the
+  server logs a clear warning about this in **Logs**; add both
+  variables and redeploy once to fix it).
