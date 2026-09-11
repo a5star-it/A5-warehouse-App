@@ -302,20 +302,38 @@ function orderIdFromFilename(fileName) {
 // date, e.g. "2026-09-10.html".
 function dateFromFilename(fileName) {
   const base = String(fileName || "").replace(/\.[^.]+$/, "").trim();
-  const m = base.match(/^(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
-  if (!m) return null;
-  const y = m[1], mo = m[2].padStart(2, "0"), d = m[3].padStart(2, "0");
-  return `${y}-${mo}-${d}`;
+  // YYYY-MM-DD (year first)
+  let m = base.match(/^(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
+  if (m) {
+    const y = m[1], mo = m[2].padStart(2, "0"), d = m[3].padStart(2, "0");
+    return `${y}-${mo}-${d}`;
+  }
+  // DD_MM_YYYY (day-month-year, European convention — year last)
+  m = base.match(/^(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})$/);
+  if (m) {
+    const d = m[1].padStart(2, "0"), mo = m[2].padStart(2, "0"), y = m[3];
+    return `${y}-${mo}-${d}`;
+  }
+  return null;
 }
 
 // Other-platform screenshots are named "{Platform} {YYYY-MM-DD}", e.g.
 // "eBay 2026-09-10.png" — returns {platform, date} or null if it doesn't match.
 function parsePlatformDateFilename(fileName) {
   const base = String(fileName || "").replace(/\.[^.]+$/, "").trim();
-  const m = base.match(/^(.+?)\s+(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
-  if (!m) return null;
-  const y = m[2], mo = m[3].padStart(2, "0"), d = m[4].padStart(2, "0");
-  return { platform: m[1].trim(), date: `${y}-${mo}-${d}` };
+  // "{Platform} {YYYY-MM-DD}" (year first)
+  let m = base.match(/^(.+?)\s+(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
+  if (m) {
+    const y = m[2], mo = m[3].padStart(2, "0"), d = m[4].padStart(2, "0");
+    return { platform: m[1].trim(), date: `${y}-${mo}-${d}` };
+  }
+  // "{Platform} {DD_MM_YYYY}" (day-month-year, European convention — year last)
+  m = base.match(/^(.+?)\s+(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})$/);
+  if (m) {
+    const d = m[2].padStart(2, "0"), mo = m[3].padStart(2, "0"), y = m[4];
+    return { platform: m[1].trim(), date: `${y}-${mo}-${d}` };
+  }
+  return null;
 }
 
 // --- Amazon Seller Central packing-slip HTML (saved page) ---------------
