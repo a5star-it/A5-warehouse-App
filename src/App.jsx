@@ -2081,7 +2081,7 @@ function SkuSearchModal({ kind, records, onClose }) {
   );
 }
 
-function RecordsList({ records, dateField, showAmount, sourceLabel, isAdmin, onDeleteClick }) {
+function RecordsList({ records, dateField, showAmount, sourceLabel, isAdmin, onDeleteClick, titleLabel }) {
   if (records.length === 0) {
     return <div style={{ padding: 16, fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>No records yet</div>;
   }
@@ -2090,7 +2090,16 @@ function RecordsList({ records, dateField, showAmount, sourceLabel, isAdmin, onD
       {records.slice(0, 30).map((r) => (
         <div key={r.id} style={{ padding: "10px 14px", borderBottom: `1px solid ${C.surfaceSoft}`, fontSize: 12.5, fontFamily: FONT_UI }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
-            <span style={{ fontWeight: 700, color: C.ink }}>{r.supplier || r.platform || r.shipmentId || "—"}</span>
+            <span style={{ fontWeight: 700, color: C.ink }}>
+              {titleLabel
+                ? titleLabel(r)
+                : (
+                  <>
+                    {r.supplier || r.platform || r.shipmentId || "—"}
+                    {r.orderId && <span style={{ fontWeight: 600, color: C.inkSoft }}> · Order {r.orderId}</span>}
+                  </>
+                )}
+            </span>
             <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
               <span style={{ fontFamily: FONT_MONO, color: C.inkSoft }}>{r[dateField] || r.date?.slice(0, 10)}</span>
               {isAdmin && onDeleteClick && (
@@ -2533,7 +2542,7 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
           records={typeRecords}
           dateField="invoiceDate"
           showAmount
-          sourceLabel={(r) => (r.orderId ? `Order ${r.orderId}` : "")}
+          titleLabel={(r) => (r.orderId ? `Order ${r.orderId} · ${r.supplier || "Unspecified"}` : r.supplier || "Unspecified")}
           isAdmin={isAdmin}
           onDeleteClick={setDeleteTarget}
         />
@@ -3291,7 +3300,8 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
         <RecordsList
           records={typeRecords}
           dateField="shipDate"
-          sourceLabel={(r) => [r.source, r.shipDate].filter(Boolean).join(" · ")}
+          titleLabel={(r) => [r.shipDate, r.platform || "Unspecified"].filter(Boolean).join(" · ")}
+          sourceLabel={(r) => r.source}
           isAdmin={isAdmin}
           onDeleteClick={setDeleteTarget}
         />
