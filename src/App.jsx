@@ -1755,6 +1755,7 @@ function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
     }
     // Bundle: split this one row into one resolved row per component.
     const newRows = comps.map((c) => ({
+      ...it,
       sku: c.sku,
       name: it.name,
       unitPrice: it.unitPrice,
@@ -3290,7 +3291,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
         <RecordsList
           records={typeRecords}
           dateField="shipDate"
-          sourceLabel={(r) => r.source}
+          sourceLabel={(r) => [r.source, r.shipDate].filter(Boolean).join(" · ")}
           isAdmin={isAdmin}
           onDeleteClick={setDeleteTarget}
         />
