@@ -32,6 +32,7 @@ function loadStore() {
   }
 }
 function saveStore(store) {
+  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
   fs.writeFileSync(DATA_FILE, JSON.stringify(store), "utf8");
 }
 
@@ -79,7 +80,12 @@ function ensureAdminSeed() {
   setUsers([{ username, passwordHash: bcrypt.hashSync(password, 10), role: "admin", createdAt: new Date().toISOString() }]);
   console.log(`[warehouse-app] Seeded initial admin account: ${username}`);
 }
-ensureAdminSeed();
+try {
+  ensureAdminSeed();
+} catch (e) {
+  console.error("[warehouse-app] Failed to seed admin account on startup:", e.message);
+  console.error("[warehouse-app] The server will still start, but nobody will be able to log in until this is fixed.");
+}
 
 function generateToken() {
   return crypto.randomBytes(32).toString("hex");
@@ -237,10 +243,26 @@ app.post("/api/extract", requireAuth, async (req, res) => {
 
 /* -----------------------------------------------------------------
    Serve the built frontend (npm run build -> dist/)
+
+   index.html is served with no-cache so browsers always check for a new
+   version on load — otherwise a browser can keep showing a stale cached
+   copy of the app indefinitely after a redeploy, even on a fresh visit
+   to the same URL. The hashed JS/CSS files in dist/assets/ are safe to
+   cache aggressively since their filename changes on every build.
 ----------------------------------------------------------------- */
 const distDir = path.join(__dirname, "dist");
-app.use(express.static(distDir));
+app.use(
+  express.static(distDir, {
+    index: false, // don't let this serve index.html with default caching — handled explicitly below
+    setHeaders: (res, filePath) => {
+      if (filePath.endsWith(".html")) {
+        res.setHeader("Cache-Control", "no-cache");
+      }
+    },
+  })
+);
 app.get("*", (req, res) => {
+  res.setHeader("Cache-Control", "no-cache");
   res.sendFile(path.join(distDir, "index.html"));
 });
 
