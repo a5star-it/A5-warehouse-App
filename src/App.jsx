@@ -108,6 +108,7 @@ import {
   Clock,
   ShieldCheck,
   History,
+  Search,
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -291,6 +292,32 @@ function parseFbaMeta(grid) {
   return meta;
 }
 
+// --- Filename conventions -------------------------------------------------
+// Inbound invoices are named after the order/invoice number itself.
+function orderIdFromFilename(fileName) {
+  return String(fileName || "").replace(/\.[^.]+$/, "").trim();
+}
+
+// Amazon FBA/order-fulfillment source files are named with just the ship
+// date, e.g. "2026-09-10.html".
+function dateFromFilename(fileName) {
+  const base = String(fileName || "").replace(/\.[^.]+$/, "").trim();
+  const m = base.match(/^(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
+  if (!m) return null;
+  const y = m[1], mo = m[2].padStart(2, "0"), d = m[3].padStart(2, "0");
+  return `${y}-${mo}-${d}`;
+}
+
+// Other-platform screenshots are named "{Platform} {YYYY-MM-DD}", e.g.
+// "eBay 2026-09-10.png" — returns {platform, date} or null if it doesn't match.
+function parsePlatformDateFilename(fileName) {
+  const base = String(fileName || "").replace(/\.[^.]+$/, "").trim();
+  const m = base.match(/^(.+?)\s+(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
+  if (!m) return null;
+  const y = m[2], mo = m[3].padStart(2, "0"), d = m[4].padStart(2, "0");
+  return { platform: m[1].trim(), date: `${y}-${mo}-${d}` };
+}
+
 // --- Amazon Seller Central packing-slip HTML (saved page) ---------------
 function isAmazonPackingSlipFile(file) {
   const name = (file.name || "").toLowerCase();
@@ -301,9 +328,19 @@ async function parseAmazonPackingSlip(file) {
   const text = await file.text();
   const doc = new DOMParser().parseFromString(text, "text/html");
   const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+  const orderIdPattern = /\d{3}-\d{7}-\d{7}/;
   const rows = [];
-  doc.querySelectorAll("tr").forEach((tr) => {
-    const detailsTd = tr.querySelector("td.myo-mena-product-details");
+  let currentOrderId = null;
+  // Walk order-ID markers and item rows together, in document order, so each
+  // row picks up the order it actually belongs to (Amazon puts the order ID
+  // in its own <div class="a-section myo-orderId"> just above that order's table).
+  doc.querySelectorAll("div.myo-orderId, tr").forEach((el) => {
+    if (el.tagName === "DIV") {
+      const m = norm(el.textContent).match(orderIdPattern);
+      if (m) currentOrderId = m[0];
+      return;
+    }
+    const detailsTd = el.querySelector("td.myo-mena-product-details");
     if (!detailsTd) return;
     const fields = {};
     detailsTd.querySelectorAll("div.a-row").forEach((row) => {
@@ -315,20 +352,17 @@ async function parseAmazonPackingSlip(file) {
     if (!fields["SKU"]) return;
     const nameSpan = detailsTd.querySelector("span.a-text-bold");
     const name = norm(nameSpan ? nameSpan.textContent : "");
-    const tds = tr.querySelectorAll(":scope > td");
+    const tds = el.querySelectorAll(":scope > td");
     const qty = Number(norm(tds[0] ? tds[0].textContent : "")) || 0;
     const priceText = tds.length > 2 ? norm(tds[2].textContent) : "";
     const unitPrice = parseFloat(priceText.replace(/[^\d,.-]/g, "").replace(",", ".")) || 0;
-    rows.push({ sku: fields["SKU"], name, qty, unitPrice });
+    if (!fields["SKU"] || qty <= 0) return;
+    rows.push({ sku: fields["SKU"], name, qty, unitPrice, orderId: currentOrderId });
   });
-  const map = new Map();
-  rows.forEach((r) => {
-    if (!r.sku || r.qty <= 0) return;
-    const cur = map.get(r.sku) || { sku: r.sku, name: r.name, qty: 0, unitPrice: r.unitPrice };
-    cur.qty += r.qty;
-    map.set(r.sku, cur);
-  });
-  return Array.from(map.values());
+  // Deliberately NOT aggregated by SKU — keeping one row per order line lets
+  // a later SKU search show exactly which order shipped how much, even when
+  // several orders in the same file ship the same product.
+  return rows;
 }
 
 function guessColumn(headers, keywords) {
@@ -375,6 +409,7 @@ function resolveSkus(items, inventory, aliasMap, ignoredSkus = []) {
         aliasComponents(alias).forEach((comp) => {
           const mult = Number(comp.qty) || 1;
           result.push({
+            ...it,
             sku: comp.sku,
             name: it.name,
             unitPrice: it.unitPrice,
@@ -1496,6 +1531,42 @@ function safeDate(v) {
 // trailing `lookbackMonths`) against current New Stock to flag what's running
 // low, and separately flags stock that's had no inbound/outbound movement in
 // over `staleThresholdDays` — a signal of slow-moving or dead inventory.
+// Reverses (or re-applies) the inventory effect of a record's item rows —
+// sign = -1 to undo an inbound (subtract what it added), +1 to undo an
+// outbound (add back what it removed). Used when an admin deletes a
+// mistaken record so inventory stays consistent with what's actually on
+// the books.
+function applySignedQty(inventory, items, field, sign) {
+  const map = new Map(inventory.map((x) => [x.sku, { ...x }]));
+  items.forEach((it) => {
+    const cur = map.get(it.sku) || { sku: it.sku, name: it.name, qtyNew: 0, qtyReturn: 0 };
+    cur[field] = (Number(cur[field]) || 0) + sign * (Number(it.qty) || 0);
+    map.set(it.sku, cur);
+  });
+  return Array.from(map.values());
+}
+
+function DeleteRecordConfirm({ record, onCancel, onConfirm }) {
+  const count = record.items.length;
+  return (
+    <Modal title="Delete this record?" accent={C.danger} onClose={onCancel}>
+      <div style={{ fontSize: 13.5, fontFamily: FONT_UI, color: C.ink, lineHeight: 1.6, marginBottom: 16 }}>
+        This removes the record and automatically reverses the {count} item row{count === 1 ? "" : "s"} it applied to
+        inventory, so stock stays accurate. This can't be undone from here — you'd need to re-upload the document to
+        restore it.
+      </div>
+      <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+        <Btn variant="outline" color={C.inkSoft} onClick={onCancel}>
+          Cancel
+        </Btn>
+        <Btn color={C.danger} icon={Trash2} onClick={onConfirm}>
+          Delete &amp; reverse inventory
+        </Btn>
+      </div>
+    </Modal>
+  );
+}
+
 function computeInsights(inventory, inboundRecords, outboundRecords, lookbackMonths, targetMonths, staleThresholdDays) {
   const now = new Date();
   const cutoff = new Date(now);
@@ -1878,7 +1949,138 @@ function ColumnMapModal({ headers, accent, showPrice, onConfirm, onCancel }) {
   );
 }
 
-function RecordsList({ records, dateField, showAmount, sourceLabel }) {
+function SkuSearchModal({ kind, records, onClose }) {
+  const [sku, setSku] = useState("");
+  const [months, setMonths] = useState(2);
+  const isInbound = kind === "inbound";
+  const accent = isInbound ? C.inboundNew : C.outbound;
+
+  const norm = normalizeSku(sku);
+  const cutoff = new Date();
+  cutoff.setMonth(cutoff.getMonth() - (Number(months) || 2));
+
+  const matches = [];
+  if (norm) {
+    records.forEach((r) => {
+      const d = safeDate(isInbound ? r.invoiceDate || r.date : r.shipDate || r.date);
+      if (!d || d < cutoff) return;
+      (r.items || []).forEach((it) => {
+        if (normalizeSku(it.sku) === norm) matches.push({ record: r, item: it, date: d });
+      });
+    });
+  }
+  matches.sort((a, b) => b.date - a.date);
+
+  const gridCols = isInbound ? "1.1fr 0.9fr 0.6fr 0.7fr" : "0.6fr 1.3fr 0.9fr 0.6fr";
+
+  return (
+    <Modal title={isInbound ? "Search Purchase History" : "Search Shipment History"} accent={accent} onClose={onClose} wide>
+      <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+        <Field label="SKU" style={{ flex: 1 }}>
+          <input
+            value={sku}
+            onChange={(e) => setSku(e.target.value)}
+            placeholder="Enter a SKU…"
+            style={{ ...inputStyle, fontFamily: FONT_MONO }}
+            autoFocus
+          />
+        </Field>
+        <Field label="Look back" style={{ width: 130 }}>
+          <select value={months} onChange={(e) => setMonths(e.target.value)} style={inputStyle}>
+            <option value={1}>1 month</option>
+            <option value={2}>2 months</option>
+            <option value={3}>3 months</option>
+            <option value={6}>6 months</option>
+            <option value={12}>12 months</option>
+          </select>
+        </Field>
+      </div>
+
+      {!norm ? (
+        <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>Enter a SKU to search.</div>
+      ) : matches.length === 0 ? (
+        <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>
+          No {isInbound ? "purchase" : "shipment"} records found for this SKU in the selected window.
+        </div>
+      ) : (
+        <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, maxHeight: 420, overflowY: "auto" }}>
+          <div
+            style={{
+              display: "grid",
+              gridTemplateColumns: gridCols,
+              padding: "8px 12px",
+              background: C.surfaceSoft,
+              fontSize: 11,
+              fontWeight: 700,
+              color: C.inkSoft,
+              fontFamily: FONT_UI,
+              position: "sticky",
+              top: 0,
+            }}
+          >
+            {isInbound ? (
+              <>
+                <div>Order</div>
+                <div>Date</div>
+                <div>Qty</div>
+                <div>Unit price</div>
+              </>
+            ) : (
+              <>
+                <div>Type</div>
+                <div>Reference</div>
+                <div>Date</div>
+                <div>Qty</div>
+              </>
+            )}
+          </div>
+          {matches.map((m, i) => (
+            <div
+              key={i}
+              style={{
+                display: "grid",
+                gridTemplateColumns: gridCols,
+                padding: "7px 12px",
+                borderTop: `1px solid ${C.surfaceSoft}`,
+                fontSize: 12.5,
+                fontFamily: FONT_UI,
+                alignItems: "center",
+              }}
+            >
+              {isInbound ? (
+                <>
+                  <div style={{ fontFamily: FONT_MONO }}>{m.record.orderId || m.record.supplier || "—"}</div>
+                  <div style={{ fontFamily: FONT_MONO }}>{m.record.invoiceDate || m.record.date?.slice(0, 10)}</div>
+                  <div style={{ fontFamily: FONT_MONO }}>{m.item.qty}</div>
+                  <div style={{ fontFamily: FONT_MONO }}>€{fmtMoney(m.item.unitPrice)}</div>
+                </>
+              ) : (
+                <>
+                  <div>
+                    <Stamp
+                      label={m.record.type === "fba" ? "FBA" : "Order"}
+                      color={m.record.type === "fba" ? C.outbound : C.outboundOrder}
+                      bg={C.surface}
+                    />
+                  </div>
+                  <div style={{ fontFamily: FONT_MONO }}>
+                    {m.record.type === "fba"
+                      ? m.record.shipmentId || "—"
+                      : [m.record.platform, m.item.orderId].filter(Boolean).join(" · ") || "—"}
+                  </div>
+                  <div style={{ fontFamily: FONT_MONO }}>{m.record.shipDate || m.record.date?.slice(0, 10)}</div>
+                  <div style={{ fontFamily: FONT_MONO }}>{m.item.qty}</div>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function RecordsList({ records, dateField, showAmount, sourceLabel, isAdmin, onDeleteClick }) {
   if (records.length === 0) {
     return <div style={{ padding: 16, fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>No records yet</div>;
   }
@@ -1886,12 +2088,23 @@ function RecordsList({ records, dateField, showAmount, sourceLabel }) {
     <div style={{ marginTop: 10, background: C.surface, border: `1px solid ${C.border}`, borderRadius: 5, maxHeight: 260, overflowY: "auto" }}>
       {records.slice(0, 30).map((r) => (
         <div key={r.id} style={{ padding: "10px 14px", borderBottom: `1px solid ${C.surfaceSoft}`, fontSize: 12.5, fontFamily: FONT_UI }}>
-          <div style={{ display: "flex", justifyContent: "space-between" }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}>
             <span style={{ fontWeight: 700, color: C.ink }}>{r.supplier || r.platform || r.shipmentId || "—"}</span>
-            <span style={{ fontFamily: FONT_MONO, color: C.inkSoft }}>{r[dateField] || r.date?.slice(0, 10)}</span>
+            <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+              <span style={{ fontFamily: FONT_MONO, color: C.inkSoft }}>{r[dateField] || r.date?.slice(0, 10)}</span>
+              {isAdmin && onDeleteClick && (
+                <button
+                  onClick={() => onDeleteClick(r)}
+                  title="Delete this record"
+                  style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft, display: "flex" }}
+                >
+                  <Trash2 size={13} />
+                </button>
+              )}
+            </div>
           </div>
           <div style={{ color: C.inkSoft, marginTop: 3 }}>
-            {r.items.length} items{sourceLabel ? ` · ${sourceLabel(r)}` : ""}
+            {r.items.length} items{sourceLabel && sourceLabel(r) ? ` · ${sourceLabel(r)}` : ""}
             {showAmount && ` · Total €${fmtMoney(r.totalAmount)}`}
           </div>
         </div>
@@ -1990,6 +2203,7 @@ function StatBox({ label, value }) {
    INBOUND HUB — choose new-stock purchase vs. return-stock inbound
 --------------------------------------------------------------- */
 function InboundHub({ setView, inboundRecords }) {
+  const [showSearch, setShowSearch] = useState(false);
   const thisMonth = new Date().toISOString().slice(0, 7);
   const countFor = (type) =>
     inboundRecords.filter((r) => (r.type || "new") === type && monthKey(r.invoiceDate || r.date) === thisMonth).length;
@@ -2016,6 +2230,11 @@ function InboundHub({ setView, inboundRecords }) {
   return (
     <div>
       <TopBar title="Inbound" subtitle="Choose the type of inbound stock" onBack={() => setView("home")} accent={C.inboundNew} />
+      <div style={{ padding: "20px 20px 0" }}>
+        <Btn color={C.inboundNew} variant="outline" icon={Search} onClick={() => setShowSearch(true)}>
+          Search purchase history by SKU
+        </Btn>
+      </div>
       <div style={{ padding: 20, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
         {cards.map((c) => (
           <div
@@ -2040,6 +2259,7 @@ function InboundHub({ setView, inboundRecords }) {
           </div>
         ))}
       </div>
+      {showSearch && <SkuSearchModal kind="inbound" records={inboundRecords} onClose={() => setShowSearch(false)} />}
     </div>
   );
 }
@@ -2062,8 +2282,20 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
   const [excelPending, setExcelPending] = useState(null);
   const [showReport, setShowReport] = useState(false);
   const [pendingDuplicate, setPendingDuplicate] = useState(null); // { file, hash, match }
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
   const typeRecords = inboundRecords.filter((r) => (r.type || "new") === type);
+
+  const performDelete = (record) => {
+    saveInventory(applySignedQty(inventory, record.items, targetField, -1));
+    saveInboundRecords(inboundRecords.filter((r) => r.id !== record.id));
+    logAudit(
+      isNew ? "inbound-new-delete" : "inbound-return-delete",
+      `Deleted ${isNew ? "new stock purchase" : "return stock inbound"} record from "${record.fileName}" (${record.supplier}) — reversed ${record.items.length} item rows`
+    );
+    setDeleteTarget(null);
+    showToast("Record deleted, inventory reversed");
+  };
 
   const handleFile = async (file) => {
     let hash = null;
@@ -2095,6 +2327,7 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
             totalAmount: resolved.reduce((s, i) => s + i.qty * i.unitPrice, 0),
             fileName: file.name,
             fileHash: hash,
+            orderId: orderIdFromFilename(file.name),
           });
           showToast(`Detected ${sectionItems.length} SKUs automatically from ${sections.length > 1 ? sections.length + " sections" : "the sheet"}`);
           return;
@@ -2125,11 +2358,20 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
         totalAmount: Number(extracted.total_amount) || 0,
         fileName: file.name,
         fileHash: hash,
+        orderId: orderIdFromFilename(file.name),
       });
       showToast("Extraction complete — please review and confirm");
     } catch (e) {
       showToast(e.message || "Recognition failed — please retry or enter manually", "error");
-      setDraft({ supplier: "", invoiceDate: todayISO(), items: [{ sku: "", name: "", qty: 1, unitPrice: 0 }], totalAmount: 0, fileName: file.name, fileHash: hash });
+      setDraft({
+        supplier: "",
+        invoiceDate: todayISO(),
+        items: [{ sku: "", name: "", qty: 1, unitPrice: 0 }],
+        totalAmount: 0,
+        fileName: file.name,
+        fileHash: hash,
+        orderId: orderIdFromFilename(file.name),
+      });
     } finally {
       setBusy(false);
     }
@@ -2152,6 +2394,7 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
       totalAmount: resolved.reduce((s, i) => s + i.qty * i.unitPrice, 0),
       fileName: excelPending.fileName,
       fileHash: excelPending.fileHash,
+      orderId: orderIdFromFilename(excelPending.fileName),
     });
     setExcelPending(null);
     showToast(`Generated ${resolved.length} item rows from the spreadsheet — please review`);
@@ -2207,6 +2450,7 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
       date: new Date().toISOString(),
       invoiceDate: draft.invoiceDate,
       supplier: draft.supplier || "Unspecified",
+      orderId: draft.orderId || "",
       fileName: draft.fileName,
       fileHash: draft.fileHash || null,
       items: cleanItems,
@@ -2254,6 +2498,9 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
               <Field label={partyLabel} style={{ flex: 1, minWidth: 160 }}>
                 <input value={draft.supplier} onChange={(e) => setDraft({ ...draft, supplier: e.target.value })} style={inputStyle} />
               </Field>
+              <Field label="Order ID" style={{ width: 140 }}>
+                <input value={draft.orderId || ""} onChange={(e) => setDraft({ ...draft, orderId: e.target.value })} style={{ ...inputStyle, fontFamily: FONT_MONO }} />
+              </Field>
               <Field label={dateLabel} style={{ width: 160 }}>
                 <input type="date" value={draft.invoiceDate} onChange={(e) => setDraft({ ...draft, invoiceDate: e.target.value })} style={inputStyle} />
               </Field>
@@ -2281,7 +2528,14 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
             </Btn>
           )}
         </div>
-        <RecordsList records={typeRecords} dateField="invoiceDate" showAmount />
+        <RecordsList
+          records={typeRecords}
+          dateField="invoiceDate"
+          showAmount
+          sourceLabel={(r) => (r.orderId ? `Order ${r.orderId}` : "")}
+          isAdmin={isAdmin}
+          onDeleteClick={setDeleteTarget}
+        />
       </div>
 
       {excelPending && (
@@ -2314,6 +2568,10 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
           onClose={() => setShowReport(false)}
         />
       )}
+
+      {deleteTarget && (
+        <DeleteRecordConfirm record={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={() => performDelete(deleteTarget)} />
+      )}
     </div>
   );
 }
@@ -2322,6 +2580,7 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
    OUTBOUND HUB — choose Amazon FBA shipment vs. order fulfillment
 --------------------------------------------------------------- */
 function OutboundHub({ setView, outboundRecords }) {
+  const [showSearch, setShowSearch] = useState(false);
   const thisMonth = new Date().toISOString().slice(0, 7);
   const countFor = (type) =>
     outboundRecords.filter((r) => (r.type || "order") === type && monthKey(r.shipDate || r.date) === thisMonth).length;
@@ -2348,6 +2607,11 @@ function OutboundHub({ setView, outboundRecords }) {
   return (
     <div>
       <TopBar title="Outbound" subtitle="Choose the type of outbound shipment" onBack={() => setView("home")} accent={C.outbound} />
+      <div style={{ padding: "20px 20px 0" }}>
+        <Btn color={C.outbound} variant="outline" icon={Search} onClick={() => setShowSearch(true)}>
+          Search shipment history by SKU
+        </Btn>
+      </div>
       <div style={{ padding: 20, display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 14 }}>
         {cards.map((c) => (
           <div
@@ -2372,6 +2636,7 @@ function OutboundHub({ setView, outboundRecords }) {
           </div>
         ))}
       </div>
+      {showSearch && <SkuSearchModal kind="outbound" records={outboundRecords} onClose={() => setShowSearch(false)} />}
     </div>
   );
 }
@@ -2385,8 +2650,18 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
   const [excelPending, setExcelPending] = useState(null);
   const [showReport, setShowReport] = useState(false);
   const [pendingDuplicate, setPendingDuplicate] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
   const typeRecords = outboundRecords.filter((r) => (r.type || "order") === "fba");
+
+  const performDelete = (record) => {
+    const field = record.source === "New Stock" ? "qtyNew" : "qtyReturn";
+    saveInventory(applySignedQty(inventory, record.items, field, 1));
+    saveOutboundRecords(outboundRecords.filter((r) => r.id !== record.id));
+    logAudit("outbound-fba-delete", `Deleted FBA shipment ${record.shipmentId} — reversed ${record.items.length} item rows`);
+    setDeleteTarget(null);
+    showToast("Record deleted, inventory reversed");
+  };
 
   const handleFile = async (file) => {
     let hash = null;
@@ -2614,7 +2889,13 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
             </Btn>
           )}
         </div>
-        <RecordsList records={typeRecords} dateField="shipDate" sourceLabel={(r) => `${r.boxes || 0} boxes`} />
+        <RecordsList
+          records={typeRecords}
+          dateField="shipDate"
+          sourceLabel={(r) => `${r.boxes || 0} boxes`}
+          isAdmin={isAdmin}
+          onDeleteClick={setDeleteTarget}
+        />
       </div>
 
       {excelPending && (
@@ -2641,6 +2922,10 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
       )}
 
       {showReport && <FbaMonthlyReportModal records={typeRecords} onClose={() => setShowReport(false)} />}
+
+      {deleteTarget && (
+        <DeleteRecordConfirm record={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={() => performDelete(deleteTarget)} />
+      )}
     </div>
   );
 }
@@ -2761,13 +3046,23 @@ function FbaMonthlyReportModal({ records, onClose }) {
 /* ---------------------------------------------------------------
    OUTBOUND — Order Fulfillment
 --------------------------------------------------------------- */
-function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords, saveOutboundRecords, inboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast }) {
+function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords, saveOutboundRecords, inboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast, isAdmin }) {
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState(null);
   const [excelPending, setExcelPending] = useState(null);
   const [pendingDuplicate, setPendingDuplicate] = useState(null);
+  const [deleteTarget, setDeleteTarget] = useState(null);
 
   const typeRecords = outboundRecords.filter((r) => (r.type || "order") === "order");
+
+  const performDelete = (record) => {
+    const field = record.source === "New Stock" ? "qtyNew" : "qtyReturn";
+    saveInventory(applySignedQty(inventory, record.items, field, 1));
+    saveOutboundRecords(outboundRecords.filter((r) => r.id !== record.id));
+    logAudit("outbound-order-delete", `Deleted order fulfillment record from "${record.fileName}" (${record.platform}) — reversed ${record.items.length} item rows`);
+    setDeleteTarget(null);
+    showToast("Record deleted, inventory reversed");
+  };
 
   const handleFile = async (file) => {
     let hash = null;
@@ -2795,7 +3090,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
         const resolved = resolveSkus(parsedItems, inventory, aliasMap, ignoredSkus);
         setDraft({
           platform: "Amazon",
-          shipDate: todayISO(),
+          shipDate: dateFromFilename(file.name) || todayISO(),
           source: "qtyNew",
           items: resolved,
           fileName: file.name,
@@ -2843,9 +3138,12 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
         name: it.name || "",
         qty: Number(it.qty) || 0,
       }));
+      // Filename convention "{Platform} {YYYY-MM-DD}" (e.g. eBay screenshots)
+      // takes priority over whatever the AI guessed from the image content.
+      const fnMeta = parsePlatformDateFilename(file.name);
       setDraft({
-        platform: extracted.platform || "",
-        shipDate: extracted.ship_date || todayISO(),
+        platform: fnMeta?.platform || extracted.platform || "",
+        shipDate: fnMeta?.date || extracted.ship_date || todayISO(),
         source: "qtyNew",
         items: resolveSkus(rawItems, inventory, aliasMap, ignoredSkus),
         fileName: file.name,
@@ -2989,7 +3287,13 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
         )}
 
         <div style={{ marginTop: 20, fontSize: 13.5, fontWeight: 700, fontFamily: FONT_UI, color: C.ink }}>Recent outbound records</div>
-        <RecordsList records={typeRecords} dateField="shipDate" sourceLabel={(r) => r.source} />
+        <RecordsList
+          records={typeRecords}
+          dateField="shipDate"
+          sourceLabel={(r) => r.source}
+          isAdmin={isAdmin}
+          onDeleteClick={setDeleteTarget}
+        />
       </div>
 
       {excelPending && (
@@ -3013,6 +3317,10 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
             processFile(file, hash);
           }}
         />
+      )}
+
+      {deleteTarget && (
+        <DeleteRecordConfirm record={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={() => performDelete(deleteTarget)} />
       )}
     </div>
   );
@@ -3439,6 +3747,7 @@ export default function WarehouseApp() {
           saveAliasMap={saveAliasMap}
           ignoredSkus={ignoredSkus}
           showToast={showToast}
+          isAdmin={isAdmin}
         />
       ) : view === "admin" && isAdmin ? (
         <AdminView setView={setView} auth={auth} />
