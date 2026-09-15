@@ -109,6 +109,7 @@ import {
   ShieldCheck,
   History,
   Search,
+  ClipboardCheck,
 } from "lucide-react";
 
 /* ---------------------------------------------------------------
@@ -902,6 +903,7 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
   const [showAliases, setShowAliases] = useState(false);
   const [showIgnored, setShowIgnored] = useState(false);
   const [showInsights, setShowInsights] = useState(false);
+  const [showStockCount, setShowStockCount] = useState(false);
 
   const filtered = inventory.filter(
     (x) => x.sku.toLowerCase().includes(query.toLowerCase()) || x.name.toLowerCase().includes(query.toLowerCase())
@@ -1032,6 +1034,11 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
               Restock Insights
             </Btn>
           )}
+          {isAdmin && (
+            <Btn onClick={() => setShowStockCount(true)} color={C.inventory} icon={ClipboardCheck}>
+              Stock Count
+            </Btn>
+          )}
           <Btn
             onClick={() => {
               const rows = [
@@ -1096,6 +1103,9 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
       {showIgnored && <IgnoredSkuManager ignoredSkus={ignoredSkus} saveIgnoredSkus={saveIgnoredSkus} onClose={() => setShowIgnored(false)} />}
       {showInsights && (
         <InsightsModal inventory={inventory} inboundRecords={inboundRecords} outboundRecords={outboundRecords} onClose={() => setShowInsights(false)} />
+      )}
+      {showStockCount && (
+        <StockCountModal inventory={inventory} saveInventory={saveInventory} showToast={showToast} onClose={() => setShowStockCount(false)} />
       )}
     </div>
   );
@@ -1259,6 +1269,202 @@ function AliasManager({ aliasMap, saveAliasMap, inventory, isAdmin, onClose }) {
           </Btn>
         )}
       </div>
+    </Modal>
+  );
+}
+
+function StockCountModal({ inventory, saveInventory, onClose, showToast }) {
+  const [step, setStep] = useState("upload"); // upload | mapping | review
+  const [target, setTarget] = useState("qtyNew"); // qtyNew | qtyReturn
+  const [note, setNote] = useState("");
+  const [excelPending, setExcelPending] = useState(null); // { rows, headers, fileName }
+  const [countedItems, setCountedItems] = useState([]); // [{ sku, name, countedQty }]
+  const [excluded, setExcluded] = useState(new Set()); // skus to skip when applying
+
+  const handleFile = async (file) => {
+    if (!isSpreadsheetFile(file)) {
+      showToast("Please upload an Excel or CSV file", "error");
+      return;
+    }
+    try {
+      const { grid, rows, headers } = await parseSpreadsheetFile(file);
+      const sections = findSkuSections(grid);
+      const sectionItems = itemsFromSkuSections(sections);
+      if (sectionItems.length > 0) {
+        setCountedItems(sectionItems.map((it) => ({ sku: it.sku, name: it.name, countedQty: it.qty })));
+        setExcluded(new Set());
+        setStep("review");
+        return;
+      }
+      if (rows.length === 0) {
+        showToast("The spreadsheet has no data rows", "error");
+        return;
+      }
+      setExcelPending({ rows, headers, fileName: file.name });
+      setStep("mapping");
+    } catch (e) {
+      showToast("Couldn't parse the spreadsheet — check the file format", "error");
+    }
+  };
+
+  const handleColumnsConfirmed = ({ skuCol, nameCol, qtyCol }) => {
+    const items = excelPending.rows
+      .map((r) => ({
+        sku: String(r[skuCol] ?? "").trim(),
+        name: nameCol ? String(r[nameCol] ?? "").trim() : "",
+        countedQty: Number(r[qtyCol]) || 0,
+      }))
+      .filter((it) => it.sku);
+    setCountedItems(items);
+    setExcluded(new Set());
+    setExcelPending(null);
+    setStep("review");
+  };
+
+  const diffRows = countedItems.map((it) => {
+    const existing = inventory.find((x) => normalizeSku(x.sku) === normalizeSku(it.sku));
+    const systemQty = existing ? Number(existing[target]) || 0 : 0;
+    return {
+      sku: it.sku,
+      name: it.name || existing?.name || it.sku,
+      systemQty,
+      countedQty: it.countedQty,
+      diff: it.countedQty - systemQty,
+    };
+  });
+  const changedRows = diffRows.filter((r) => r.diff !== 0);
+  const includedRows = diffRows.filter((r) => !excluded.has(r.sku));
+  const netMovement = includedRows.reduce((s, r) => s + Math.abs(r.diff), 0);
+
+  const toggleRow = (sku) => {
+    const next = new Set(excluded);
+    if (next.has(sku)) next.delete(sku);
+    else next.add(sku);
+    setExcluded(next);
+  };
+
+  const applyCount = () => {
+    const map = new Map(inventory.map((x) => [x.sku, { ...x }]));
+    includedRows.forEach((row) => {
+      const cur = map.get(row.sku) || { sku: row.sku, name: row.name, qtyNew: 0, qtyReturn: 0 };
+      cur[target] = row.countedQty;
+      if (row.name && !cur.name) cur.name = row.name;
+      map.set(row.sku, cur);
+    });
+    saveInventory(Array.from(map.values()));
+    const label = note.trim() || "Stock count";
+    const changedIncluded = includedRows.filter((r) => r.diff !== 0).length;
+    logAudit(
+      "stock-count",
+      `${label}: reconciled ${includedRows.length} SKUs (${target === "qtyNew" ? "New Stock" : "Return Stock"}) — ${changedIncluded} changed, net movement ${netMovement} units`
+    );
+    showToast("Stock count applied, inventory updated");
+    onClose();
+  };
+
+  return (
+    <Modal title="Stock Count" accent={C.inventory} onClose={onClose} wide>
+      {step === "upload" && (
+        <>
+          <div style={{ fontSize: 12.5, color: C.inkSoft, fontFamily: FONT_UI, marginBottom: 16 }}>
+            Upload a spreadsheet with two columns — SKU and counted quantity. This can cover all your SKUs or just
+            the ones you're responsible for; anything not in the sheet is left untouched.
+          </div>
+          <div style={{ display: "flex", gap: 10, marginBottom: 16 }}>
+            <Field label="Applies to" style={{ width: 180 }}>
+              <select value={target} onChange={(e) => setTarget(e.target.value)} style={inputStyle}>
+                <option value="qtyNew">New Stock (A)</option>
+                <option value="qtyReturn">Return Stock (B)</option>
+              </select>
+            </Field>
+            <Field label="Note (shown in the audit log)" style={{ flex: 1 }}>
+              <input
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                placeholder="e.g. Starting inventory launch, September count…"
+                style={inputStyle}
+              />
+            </Field>
+          </div>
+          <UploadBox
+            accent={C.inventory}
+            accentSoft={C.surfaceSoft}
+            label="Click or drag to upload your count"
+            hint="Excel or CSV — two columns: SKU and counted quantity"
+            onFile={handleFile}
+            busy={false}
+          />
+        </>
+      )}
+
+      {step === "mapping" && excelPending && (
+        <ColumnMapModal headers={excelPending.headers} accent={C.inventory} showPrice={false} onConfirm={handleColumnsConfirmed} onCancel={onClose} />
+      )}
+
+      {step === "review" && (
+        <>
+          <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+            <StatBox label="Counted" value={diffRows.length} />
+            <StatBox label="Differ" value={changedRows.length} />
+            <StatBox label="Net movement" value={netMovement} />
+          </div>
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, maxHeight: 380, overflowY: "auto", marginBottom: 16 }}>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "26px 1fr 1.4fr 0.8fr 0.8fr 0.8fr",
+                padding: "7px 12px",
+                background: C.surfaceSoft,
+                fontSize: 11,
+                fontWeight: 700,
+                color: C.inkSoft,
+                fontFamily: FONT_UI,
+                position: "sticky",
+                top: 0,
+              }}
+            >
+              <div></div>
+              <div>SKU</div>
+              <div>Product</div>
+              <div>System</div>
+              <div>Counted</div>
+              <div>Diff</div>
+            </div>
+            {diffRows.map((r) => (
+              <div
+                key={r.sku}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "26px 1fr 1.4fr 0.8fr 0.8fr 0.8fr",
+                  padding: "6px 12px",
+                  borderTop: `1px solid ${C.surfaceSoft}`,
+                  fontSize: 12.5,
+                  fontFamily: FONT_UI,
+                  alignItems: "center",
+                  opacity: excluded.has(r.sku) ? 0.4 : 1,
+                }}
+              >
+                <input type="checkbox" checked={!excluded.has(r.sku)} onChange={() => toggleRow(r.sku)} />
+                <div style={{ fontFamily: FONT_MONO }}>{r.sku}</div>
+                <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{r.name}</div>
+                <div style={{ fontFamily: FONT_MONO }}>{r.systemQty}</div>
+                <div style={{ fontFamily: FONT_MONO }}>{r.countedQty}</div>
+                <div style={{ fontFamily: FONT_MONO, fontWeight: 700, color: r.diff === 0 ? C.inkSoft : r.diff > 0 ? C.inboundNew : C.danger }}>
+                  {r.diff > 0 ? `+${r.diff}` : r.diff}
+                </div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+            <Btn variant="outline" color={C.inkSoft} onClick={onClose}>
+              Cancel
+            </Btn>
+            <Btn color={C.inventory} icon={CheckCircle2} onClick={applyCount} disabled={includedRows.length === 0}>
+              Apply count ({includedRows.length} SKUs)
+            </Btn>
+          </div>
+        </>
+      )}
     </Modal>
   );
 }
