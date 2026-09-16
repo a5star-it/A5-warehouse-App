@@ -215,6 +215,153 @@ app.put("/api/kv/:key", requireAuth, (req, res) => {
 });
 
 /* -----------------------------------------------------------------
+   Atomic inventory adjustments. Every inventory-mutating action in the
+   app (inbound/outbound confirm, manual adjust, record deletion, stock
+   count) goes through this endpoint instead of overwriting the whole
+   inventory array from the client's in-memory copy. That copy can be
+   stale — someone else may have confirmed a shipment since this
+   browser last loaded — and blindly writing a full stale snapshot back
+   would silently erase their change. Here, each operation only touches
+   the specific SKU/field it names, computed fresh against the current
+   on-disk state inside one synchronous request, so concurrent edits
+   from different people never clobber each other.
+
+   Body: { operations: [{ sku, name?, field: "qtyNew"|"qtyReturn",
+           mode: "delta"|"set"|"delete", value? }] }
+----------------------------------------------------------------- */
+app.post("/api/inventory/adjust", requireAuth, (req, res) => {
+  const { operations } = req.body || {};
+  if (!Array.isArray(operations)) return res.status(400).json({ error: "operations array required" });
+
+  const store = loadStore();
+  let inventory = [];
+  try {
+    inventory = JSON.parse(store.inventory || "[]");
+  } catch (e) {
+    inventory = [];
+  }
+  const map = new Map(inventory.map((x) => [x.sku, x]));
+
+  operations.forEach((op) => {
+    const sku = op && op.sku;
+    if (!sku) return;
+    if (op.mode === "delete") {
+      map.delete(sku);
+      return;
+    }
+    if (!op.field) return;
+    const cur = map.get(sku) || { sku, name: op.name || sku, qtyNew: 0, qtyReturn: 0 };
+    if (op.mode === "delta") {
+      cur[op.field] = (Number(cur[op.field]) || 0) + (Number(op.value) || 0);
+    } else {
+      cur[op.field] = Number(op.value) || 0;
+    }
+    if (op.name && !cur.name) cur.name = op.name;
+    map.set(sku, cur);
+  });
+
+  const next = Array.from(map.values());
+  store.inventory = JSON.stringify(next);
+  saveStore(store);
+  res.json({ ok: true, inventory: next });
+});
+
+/* -----------------------------------------------------------------
+   Same "never overwrite from a possibly-stale client snapshot"
+   principle, applied to the other shared collections: inbound/outbound
+   record lists, SKU mapping rules, and ignored codes. Each endpoint
+   reads the CURRENT on-disk state and applies one precise change,
+   instead of the client sending back a full array/object it built
+   from data it may have loaded a while ago.
+----------------------------------------------------------------- */
+function loadArrayKey(key) {
+  const store = loadStore();
+  try {
+    return JSON.parse(store[key] || "[]");
+  } catch (e) {
+    return [];
+  }
+}
+function saveArrayKey(key, arr) {
+  const store = loadStore();
+  store[key] = JSON.stringify(arr);
+  saveStore(store);
+}
+function loadObjectKey(key) {
+  const store = loadStore();
+  try {
+    return JSON.parse(store[key] || "{}");
+  } catch (e) {
+    return {};
+  }
+}
+function saveObjectKey(key, obj) {
+  const store = loadStore();
+  store[key] = JSON.stringify(obj);
+  saveStore(store);
+}
+function normalizeSkuServer(s) {
+  return String(s || "").trim().toUpperCase().replace(/[\s\-_./]/g, "");
+}
+
+const RECORD_KEYS = ["inbound-records", "outbound-records"];
+
+app.post("/api/records/:key/add", requireAuth, (req, res) => {
+  const key = req.params.key;
+  if (!RECORD_KEYS.includes(key)) return res.status(400).json({ error: "invalid key" });
+  const { record } = req.body || {};
+  if (!record || !record.id) return res.status(400).json({ error: "record with an id is required" });
+  const arr = loadArrayKey(key);
+  arr.unshift(record);
+  saveArrayKey(key, arr);
+  res.json({ ok: true, records: arr });
+});
+
+app.post("/api/records/:key/remove", requireAuth, (req, res) => {
+  const key = req.params.key;
+  if (!RECORD_KEYS.includes(key)) return res.status(400).json({ error: "invalid key" });
+  const { id } = req.body || {};
+  if (!id) return res.status(400).json({ error: "id is required" });
+  const arr = loadArrayKey(key).filter((r) => r.id !== id);
+  saveArrayKey(key, arr);
+  res.json({ ok: true, records: arr });
+});
+
+app.post("/api/aliases/set", requireAuth, (req, res) => {
+  const { key, value } = req.body || {};
+  if (!key || !value) return res.status(400).json({ error: "key and value are required" });
+  const obj = loadObjectKey("sku-aliases");
+  obj[key] = value;
+  saveObjectKey("sku-aliases", obj);
+  res.json({ ok: true, aliases: obj });
+});
+
+app.post("/api/aliases/delete", requireAuth, (req, res) => {
+  const { key } = req.body || {};
+  if (!key) return res.status(400).json({ error: "key is required" });
+  const obj = loadObjectKey("sku-aliases");
+  delete obj[key];
+  saveObjectKey("sku-aliases", obj);
+  res.json({ ok: true, aliases: obj });
+});
+
+app.post("/api/ignored-skus/add", requireAuth, (req, res) => {
+  const { value } = req.body || {};
+  if (!value) return res.status(400).json({ error: "value is required" });
+  const arr = loadArrayKey("ignored-skus");
+  if (!arr.some((s) => normalizeSkuServer(s) === normalizeSkuServer(value))) arr.push(value);
+  saveArrayKey("ignored-skus", arr);
+  res.json({ ok: true, items: arr });
+});
+
+app.post("/api/ignored-skus/remove", requireAuth, (req, res) => {
+  const { value } = req.body || {};
+  const arr = loadArrayKey("ignored-skus").filter((s) => s !== value);
+  saveArrayKey("ignored-skus", arr);
+  res.json({ ok: true, items: arr });
+});
+
+/* -----------------------------------------------------------------
    AI extraction proxy. The API key lives only on the server — the
    browser never sees it.
 ----------------------------------------------------------------- */
