@@ -1149,7 +1149,15 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
         <InsightsModal inventory={inventory} inboundRecords={inboundRecords} outboundRecords={outboundRecords} onClose={() => setShowInsights(false)} />
       )}
       {showStockCount && (
-        <StockCountModal inventory={inventory} applyInventoryOps={applyInventoryOps} showToast={showToast} onClose={() => setShowStockCount(false)} />
+        <StockCountModal
+          inventory={inventory}
+          applyInventoryOps={applyInventoryOps}
+          aliasMap={aliasMap}
+          setAlias={setAlias}
+          ignoredSkus={ignoredSkus}
+          showToast={showToast}
+          onClose={() => setShowStockCount(false)}
+        />
       )}
       {showBrandImport && (
         <BrandImportModal inventory={inventory} applyInventoryOps={applyInventoryOps} showToast={showToast} onClose={() => setShowBrandImport(false)} />
@@ -1505,13 +1513,24 @@ function BrandImportModal({ inventory, applyInventoryOps, onClose, showToast }) 
   );
 }
 
-function StockCountModal({ inventory, applyInventoryOps, onClose, showToast }) {
-  const [step, setStep] = useState("upload"); // upload | mapping | review
+function StockCountModal({ inventory, applyInventoryOps, aliasMap, setAlias, ignoredSkus, onClose, showToast }) {
+  const [step, setStep] = useState("upload"); // upload | mapping | resolve | review
   const [target, setTarget] = useState("qtyNew"); // qtyNew | qtyReturn
   const [note, setNote] = useState("");
   const [excelPending, setExcelPending] = useState(null); // { rows, headers, fileName }
-  const [countedItems, setCountedItems] = useState([]); // [{ sku, name, countedQty }]
+  const [resolveItems, setResolveItems] = useState([]); // items being SKU-resolved via ItemsEditor
+  const [countedItems, setCountedItems] = useState([]); // [{ sku, name, countedQty }] — after resolution
   const [excluded, setExcluded] = useState(new Set()); // skus to skip when applying
+
+  const startResolving = (rawItems) => {
+    // rawItems: [{ sku, name, countedQty }] — reuse the same SKU-mapping engine
+    // as inbound/outbound (bundle expansion, learned aliases, unresolved flags)
+    // by treating the counted quantity as the "qty" resolveSkus expects.
+    const asQtyItems = rawItems.map((it) => ({ sku: it.sku, name: it.name, qty: it.countedQty, unitPrice: 0 }));
+    const resolved = resolveSkus(asQtyItems, inventory, aliasMap, ignoredSkus);
+    setResolveItems(resolved);
+    setStep("resolve");
+  };
 
   const handleFile = async (file) => {
     if (!isSpreadsheetFile(file)) {
@@ -1523,9 +1542,7 @@ function StockCountModal({ inventory, applyInventoryOps, onClose, showToast }) {
       const sections = findSkuSections(grid);
       const sectionItems = itemsFromSkuSections(sections);
       if (sectionItems.length > 0) {
-        setCountedItems(sectionItems.map((it) => ({ sku: it.sku, name: it.name, countedQty: it.qty })));
-        setExcluded(new Set());
-        setStep("review");
+        startResolving(sectionItems.map((it) => ({ sku: it.sku, name: it.name, countedQty: it.qty })));
         return;
       }
       if (rows.length === 0) {
@@ -1547,9 +1564,32 @@ function StockCountModal({ inventory, applyInventoryOps, onClose, showToast }) {
         countedQty: Number(r[qtyCol]) || 0,
       }))
       .filter((it) => it.sku);
-    setCountedItems(items);
-    setExcluded(new Set());
     setExcelPending(null);
+    startResolving(items);
+  };
+
+  const confirmResolution = () => {
+    const finalItems = resolveItems
+      .filter((it) => it.sku.trim() && Number(it.qty) > 0)
+      .map((it) => ({ sku: it.sku.trim(), name: it.name, countedQty: Number(it.qty), mappedFrom: it.mappedFrom, qtyMultiplier: it.qtyMultiplier }));
+    // Teach any hand-mapped rules, same convention as inbound/outbound.
+    const mapGroups = new Map();
+    finalItems.forEach((it) => {
+      if (!it.mappedFrom) return;
+      const norm = normalizeSku(it.mappedFrom);
+      if (!mapGroups.has(norm)) mapGroups.set(norm, { raw: it.mappedFrom, components: [] });
+      mapGroups.get(norm).components.push({ sku: it.sku, qty: Number(it.qtyMultiplier) || 1 });
+    });
+    mapGroups.forEach((val, norm) => {
+      const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
+      const changed =
+        !existing ||
+        existing.length !== val.components.length ||
+        existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
+      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
+    });
+    setCountedItems(finalItems);
+    setExcluded(new Set());
     setStep("review");
   };
 
@@ -1631,6 +1671,24 @@ function StockCountModal({ inventory, applyInventoryOps, onClose, showToast }) {
 
       {step === "mapping" && excelPending && (
         <ColumnMapModal headers={excelPending.headers} accent={C.inventory} showPrice={false} onConfirm={handleColumnsConfirmed} onCancel={onClose} />
+      )}
+
+      {step === "resolve" && (
+        <>
+          <div style={{ fontSize: 12.5, color: C.inkSoft, fontFamily: FONT_UI, marginBottom: 14 }}>
+            Matching these against your existing SKUs first — map anything unrecognized (variant codes, multi-packs,
+            bundles) before comparing counted quantities to what's on the books.
+          </div>
+          <ItemsEditor items={resolveItems} setItems={setResolveItems} showPrice={false} inventory={inventory} />
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 14 }}>
+            <Btn variant="outline" color={C.inkSoft} onClick={onClose}>
+              Cancel
+            </Btn>
+            <Btn color={C.inventory} onClick={confirmResolution}>
+              Continue to review
+            </Btn>
+          </div>
+        </>
       )}
 
       {step === "review" && (
