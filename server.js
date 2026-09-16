@@ -254,7 +254,10 @@ app.post("/api/inventory/adjust", requireAuth, (req, res) => {
     if (op.mode === "delta") {
       cur[op.field] = (Number(cur[op.field]) || 0) + (Number(op.value) || 0);
     } else {
-      cur[op.field] = Number(op.value) || 0;
+      // "set" stores the value as-is — quantities arrive as numbers, text
+      // fields like brand arrive as strings; forcing everything through
+      // Number() here would silently zero out any non-numeric field.
+      cur[op.field] = op.value;
     }
     if (op.name && !cur.name) cur.name = op.name;
     map.set(sku, cur);
