@@ -898,25 +898,31 @@ function Home({ setView, inventory, inboundRecords, outboundRecords, auth, onLog
 --------------------------------------------------------------- */
 function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, showToast, aliasMap, saveAliasMap, setAlias, deleteAlias, ignoredSkus, saveIgnoredSkus, addIgnoredSku, removeIgnoredSku, inboundRecords, outboundRecords, isAdmin }) {
   const [query, setQuery] = useState("");
+  const [brandFilter, setBrandFilter] = useState("");
   const [editing, setEditing] = useState(null); // sku or 'new'
-  const [form, setForm] = useState({ sku: "", name: "", qtyNew: 0, qtyReturn: 0 });
+  const [form, setForm] = useState({ sku: "", name: "", brand: "", qtyNew: 0, qtyReturn: 0 });
   const [showAliases, setShowAliases] = useState(false);
   const [showIgnored, setShowIgnored] = useState(false);
   const [showInsights, setShowInsights] = useState(false);
   const [showStockCount, setShowStockCount] = useState(false);
+  const [showBrandImport, setShowBrandImport] = useState(false);
+
+  const brands = Array.from(new Set(inventory.map((x) => (x.brand || "").trim()).filter(Boolean))).sort();
 
   const filtered = inventory.filter(
-    (x) => x.sku.toLowerCase().includes(query.toLowerCase()) || x.name.toLowerCase().includes(query.toLowerCase())
+    (x) =>
+      (x.sku.toLowerCase().includes(query.toLowerCase()) || x.name.toLowerCase().includes(query.toLowerCase())) &&
+      (!brandFilter || (x.brand || "").trim() === brandFilter)
   );
   const totalNew = inventory.reduce((s, x) => s + (x.qtyNew || 0), 0);
   const totalReturn = inventory.reduce((s, x) => s + (x.qtyReturn || 0), 0);
 
   const openNew = () => {
-    setForm({ sku: "", name: "", qtyNew: 0, qtyReturn: 0 });
+    setForm({ sku: "", name: "", brand: "", qtyNew: 0, qtyReturn: 0 });
     setEditing("new");
   };
   const openEdit = (item) => {
-    setForm({ ...item });
+    setForm({ brand: "", ...item });
     setEditing(item.sku);
   };
 
@@ -928,14 +934,16 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
     const record = {
       sku: form.sku.trim(),
       name: form.name.trim(),
+      brand: (form.brand || "").trim(),
       qtyNew: Number(form.qtyNew) || 0,
       qtyReturn: Number(form.qtyReturn) || 0,
     };
     applyInventoryOps([
       { sku: record.sku, name: record.name, field: "qtyNew", mode: "set", value: record.qtyNew },
       { sku: record.sku, name: record.name, field: "qtyReturn", mode: "set", value: record.qtyReturn },
+      { sku: record.sku, name: record.name, field: "brand", mode: "set", value: record.brand },
     ]);
-    logAudit("inventory-adjust", `Set ${record.sku} to New=${record.qtyNew}, Return=${record.qtyReturn}`);
+    logAudit("inventory-adjust", `Set ${record.sku} to New=${record.qtyNew}, Return=${record.qtyReturn}${record.brand ? `, Brand=${record.brand}` : ""}`);
     setEditing(null);
     showToast("Inventory updated");
   };
@@ -985,6 +993,7 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
               <div style={{ fontFamily: FONT_MONO, fontWeight: 700, color: C.ink }}>{x.sku}</div>
               <div style={{ color: C.inkSoft, fontFamily: FONT_UI, fontSize: 12, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
                 {x.name}
+                {x.brand && <span style={{ color: C.inventory, fontWeight: 600 }}> · {x.brand}</span>}
               </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
@@ -1019,9 +1028,24 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
               outline: "none",
             }}
           />
+          <select
+            value={brandFilter}
+            onChange={(e) => setBrandFilter(e.target.value)}
+            style={{ ...inputStyle, width: 160 }}
+          >
+            <option value="">All brands</option>
+            {brands.map((b) => (
+              <option key={b} value={b}>{b}</option>
+            ))}
+          </select>
           <Btn onClick={openNew} color={C.inventory} icon={Plus}>
             Add / Adjust
           </Btn>
+          {isAdmin && (
+            <Btn onClick={() => setShowBrandImport(true)} color={C.inventory} variant="outline" icon={Upload}>
+              Import Brands
+            </Btn>
+          )}
           <Btn onClick={() => setShowAliases(true)} color={C.inkSoft} variant="outline" icon={Link2}>
             SKU Mapping Rules
           </Btn>
@@ -1077,6 +1101,19 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
           <Field label="Product name">
             <input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} style={inputStyle} />
           </Field>
+          <Field label="Brand">
+            <input
+              value={form.brand || ""}
+              onChange={(e) => setForm({ ...form, brand: e.target.value })}
+              style={inputStyle}
+              list="wh-brand-datalist"
+            />
+            <datalist id="wh-brand-datalist">
+              {brands.map((b) => (
+                <option key={b} value={b} />
+              ))}
+            </datalist>
+          </Field>
           <div style={{ display: "flex", gap: 10 }}>
             <Field label="New qty" style={{ flex: 1 }}>
               <input type="number" value={form.qtyNew} onChange={(e) => setForm({ ...form, qtyNew: e.target.value })} style={inputStyle} />
@@ -1113,6 +1150,9 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
       )}
       {showStockCount && (
         <StockCountModal inventory={inventory} applyInventoryOps={applyInventoryOps} showToast={showToast} onClose={() => setShowStockCount(false)} />
+      )}
+      {showBrandImport && (
+        <BrandImportModal inventory={inventory} applyInventoryOps={applyInventoryOps} showToast={showToast} onClose={() => setShowBrandImport(false)} />
       )}
     </div>
   );
@@ -1274,6 +1314,193 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
           </Btn>
         )}
       </div>
+    </Modal>
+  );
+}
+
+function BrandImportModal({ inventory, applyInventoryOps, onClose, showToast }) {
+  const [step, setStep] = useState("upload"); // upload | mapping | review
+  const [pending, setPending] = useState(null); // { rows, headers, fileName }
+  const [skuCol, setSkuCol] = useState("");
+  const [brandCol, setBrandCol] = useState("");
+  const [rows, setRows] = useState([]); // [{ sku, brand }]
+
+  const buildRows = (dataRows, sCol, bCol) =>
+    dataRows
+      .map((r) => ({ sku: String(r[sCol] ?? "").trim(), brand: String(r[bCol] ?? "").trim() }))
+      .filter((it) => it.sku && it.brand);
+
+  const handleFile = async (file) => {
+    if (!isSpreadsheetFile(file)) {
+      showToast("Please upload an Excel or CSV file", "error");
+      return;
+    }
+    try {
+      const { rows: dataRows, headers } = await parseSpreadsheetFile(file);
+      if (dataRows.length === 0) {
+        showToast("The spreadsheet has no data rows", "error");
+        return;
+      }
+      const guessedSku = guessColumn(headers, ["sku", "codice", "model", "code"]);
+      const guessedBrand = guessColumn(headers, ["brand", "marca", "manufacturer", "brand name"]);
+      if (guessedSku && guessedBrand) {
+        setRows(buildRows(dataRows, guessedSku, guessedBrand));
+        setStep("review");
+        return;
+      }
+      setPending({ rows: dataRows, headers, fileName: file.name });
+      setSkuCol(guessedSku);
+      setBrandCol(guessedBrand);
+      setStep("mapping");
+    } catch (e) {
+      showToast("Couldn't parse the spreadsheet — check the file format", "error");
+    }
+  };
+
+  const confirmMapping = () => {
+    if (!skuCol || !brandCol) return;
+    setRows(buildRows(pending.rows, skuCol, brandCol));
+    setPending(null);
+    setStep("review");
+  };
+
+  const diffRows = rows.map((r) => {
+    const existing = inventory.find((x) => normalizeSku(x.sku) === normalizeSku(r.sku));
+    return {
+      sku: r.sku,
+      name: existing?.name || r.sku,
+      currentBrand: existing?.brand || "",
+      newBrand: r.brand,
+      exists: !!existing,
+    };
+  });
+  const changedRows = diffRows.filter((r) => r.exists && r.currentBrand !== r.newBrand);
+  const applicableRows = diffRows.filter((r) => r.exists);
+
+  const applyBrands = () => {
+    const operations = applicableRows.map((r) => ({ sku: r.sku, name: r.name, field: "brand", mode: "set", value: r.newBrand }));
+    applyInventoryOps(operations);
+    logAudit("inventory-brand-import", `Imported brand for ${applicableRows.length} SKUs — ${changedRows.length} changed`);
+    showToast("Brands updated");
+    onClose();
+  };
+
+  return (
+    <Modal title="Import Brands" accent={C.inventory} onClose={onClose} wide>
+      {step === "upload" && (
+        <>
+          <div style={{ fontSize: 12.5, color: C.inkSoft, fontFamily: FONT_UI, marginBottom: 16 }}>
+            Upload a spreadsheet with two columns — SKU and Brand. Matching SKUs already in inventory get their brand
+            set or updated; SKUs not found in inventory yet are skipped. This applies to a product overall, not
+            separately for New/Return stock.
+          </div>
+          <UploadBox
+            accent={C.inventory}
+            accentSoft={C.surfaceSoft}
+            label="Click or drag to upload SKU/Brand list"
+            hint="Excel or CSV — two columns: SKU and Brand"
+            onFile={handleFile}
+            busy={false}
+          />
+        </>
+      )}
+
+      {step === "mapping" && pending && (
+        <>
+          <div style={{ fontSize: 12.5, color: C.inkSoft, fontFamily: FONT_UI, marginBottom: 14 }}>
+            Couldn't automatically detect the columns — please match them below.
+          </div>
+          <Field label="SKU column *">
+            <select value={skuCol} onChange={(e) => setSkuCol(e.target.value)} style={inputStyle}>
+              <option value="">Select…</option>
+              {pending.headers.map((h) => (
+                <option key={h} value={h}>{h}</option>
+              ))}
+            </select>
+          </Field>
+          <Field label="Brand column *">
+            <select value={brandCol} onChange={(e) => setBrandCol(e.target.value)} style={inputStyle}>
+              <option value="">Select…</option>
+              {pending.headers.map((h) => (
+                <option key={h} value={h}>{h}</option>
+              ))}
+            </select>
+          </Field>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 10 }}>
+            <Btn variant="outline" color={C.inkSoft} onClick={onClose}>
+              Cancel
+            </Btn>
+            <Btn color={C.inventory} disabled={!skuCol || !brandCol} onClick={confirmMapping}>
+              Continue
+            </Btn>
+          </div>
+        </>
+      )}
+
+      {step === "review" && (
+        <>
+          <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+            <StatBox label="Rows read" value={diffRows.length} />
+            <StatBox label="Matched in inventory" value={applicableRows.length} />
+            <StatBox label="Will change" value={changedRows.length} />
+          </div>
+          <div style={{ fontSize: 11.5, color: C.inkSoft, fontFamily: FONT_UI, marginBottom: 10 }}>
+            Rows marked "not in inventory" below are skipped — brands are only applied to SKUs that already exist.
+          </div>
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, maxHeight: 380, overflowY: "auto", marginBottom: 16 }}>
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "1fr 1.4fr 1fr 1fr",
+                padding: "7px 12px",
+                background: C.surfaceSoft,
+                fontSize: 11,
+                fontWeight: 700,
+                color: C.inkSoft,
+                fontFamily: FONT_UI,
+                position: "sticky",
+                top: 0,
+              }}
+            >
+              <div>SKU</div>
+              <div>Product</div>
+              <div>Current brand</div>
+              <div>New brand</div>
+            </div>
+            {diffRows.map((r) => (
+              <div
+                key={r.sku}
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "1fr 1.4fr 1fr 1fr",
+                  padding: "6px 12px",
+                  borderTop: `1px solid ${C.surfaceSoft}`,
+                  fontSize: 12.5,
+                  fontFamily: FONT_UI,
+                  alignItems: "center",
+                  opacity: r.exists ? 1 : 0.45,
+                }}
+              >
+                <div style={{ fontFamily: FONT_MONO }}>{r.sku}</div>
+                <div style={{ whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
+                  {r.name}
+                  {!r.exists && " (not in inventory)"}
+                </div>
+                <div style={{ color: C.inkSoft }}>{r.currentBrand || "—"}</div>
+                <div style={{ fontWeight: 700, color: r.currentBrand !== r.newBrand ? C.inventory : C.inkSoft }}>{r.newBrand}</div>
+              </div>
+            ))}
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+            <Btn variant="outline" color={C.inkSoft} onClick={onClose}>
+              Cancel
+            </Btn>
+            <Btn color={C.inventory} icon={CheckCircle2} onClick={applyBrands} disabled={applicableRows.length === 0}>
+              Apply brands ({applicableRows.length} SKUs)
+            </Btn>
+          </div>
+        </>
+      )}
     </Modal>
   );
 }
