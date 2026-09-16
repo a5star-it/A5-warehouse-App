@@ -896,7 +896,7 @@ function Home({ setView, inventory, inboundRecords, outboundRecords, auth, onLog
 /* ---------------------------------------------------------------
    INVENTORY VIEW
 --------------------------------------------------------------- */
-function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap, saveAliasMap, ignoredSkus, saveIgnoredSkus, inboundRecords, outboundRecords, isAdmin }) {
+function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, showToast, aliasMap, saveAliasMap, setAlias, deleteAlias, ignoredSkus, saveIgnoredSkus, addIgnoredSku, removeIgnoredSku, inboundRecords, outboundRecords, isAdmin }) {
   const [query, setQuery] = useState("");
   const [editing, setEditing] = useState(null); // sku or 'new'
   const [form, setForm] = useState({ sku: "", name: "", qtyNew: 0, qtyReturn: 0 });
@@ -925,24 +925,23 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
       showToast("SKU and product name are required", "error");
       return;
     }
-    const next = [...inventory];
-    const idx = next.findIndex((x) => x.sku === form.sku.trim());
     const record = {
       sku: form.sku.trim(),
       name: form.name.trim(),
       qtyNew: Number(form.qtyNew) || 0,
       qtyReturn: Number(form.qtyReturn) || 0,
     };
-    if (idx >= 0) next[idx] = record;
-    else next.push(record);
-    saveInventory(next);
+    applyInventoryOps([
+      { sku: record.sku, name: record.name, field: "qtyNew", mode: "set", value: record.qtyNew },
+      { sku: record.sku, name: record.name, field: "qtyReturn", mode: "set", value: record.qtyReturn },
+    ]);
     logAudit("inventory-adjust", `Set ${record.sku} to New=${record.qtyNew}, Return=${record.qtyReturn}`);
     setEditing(null);
     showToast("Inventory updated");
   };
 
   const removeItem = (sku) => {
-    saveInventory(inventory.filter((x) => x.sku !== sku));
+    applyInventoryOps([{ sku, mode: "delete" }]);
     logAudit("inventory-delete", `Deleted inventory item ${sku}`);
     showToast("Item deleted");
   };
@@ -1098,20 +1097,28 @@ function InventoryView({ setView, inventory, saveInventory, showToast, aliasMap,
       )}
 
       {showAliases && (
-        <AliasManager aliasMap={aliasMap} saveAliasMap={saveAliasMap} inventory={inventory} isAdmin={isAdmin} onClose={() => setShowAliases(false)} />
+        <AliasManager aliasMap={aliasMap} saveAliasMap={saveAliasMap} setAlias={setAlias} deleteAlias={deleteAlias} inventory={inventory} isAdmin={isAdmin} onClose={() => setShowAliases(false)} />
       )}
-      {showIgnored && <IgnoredSkuManager ignoredSkus={ignoredSkus} saveIgnoredSkus={saveIgnoredSkus} onClose={() => setShowIgnored(false)} />}
+      {showIgnored && (
+        <IgnoredSkuManager
+          ignoredSkus={ignoredSkus}
+          saveIgnoredSkus={saveIgnoredSkus}
+          addIgnoredSku={addIgnoredSku}
+          removeIgnoredSku={removeIgnoredSku}
+          onClose={() => setShowIgnored(false)}
+        />
+      )}
       {showInsights && (
         <InsightsModal inventory={inventory} inboundRecords={inboundRecords} outboundRecords={outboundRecords} onClose={() => setShowInsights(false)} />
       )}
       {showStockCount && (
-        <StockCountModal inventory={inventory} saveInventory={saveInventory} showToast={showToast} onClose={() => setShowStockCount(false)} />
+        <StockCountModal inventory={inventory} applyInventoryOps={applyInventoryOps} showToast={showToast} onClose={() => setShowStockCount(false)} />
       )}
     </div>
   );
 }
 
-function AliasManager({ aliasMap, saveAliasMap, inventory, isAdmin, onClose }) {
+function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory, isAdmin, onClose }) {
   const entries = Object.entries(aliasMap || {});
   const [showAdd, setShowAdd] = useState(false);
   const [rawInput, setRawInput] = useState("");
@@ -1119,9 +1126,7 @@ function AliasManager({ aliasMap, saveAliasMap, inventory, isAdmin, onClose }) {
 
   const remove = (key) => {
     const raw = aliasMap[key]?.raw || key;
-    const next = { ...aliasMap };
-    delete next[key];
-    saveAliasMap(next);
+    deleteAlias(key);
     logAudit("alias-delete", `Removed SKU mapping rule for "${raw}"`);
   };
   const exportCSV = () => {
@@ -1141,7 +1146,7 @@ function AliasManager({ aliasMap, saveAliasMap, inventory, isAdmin, onClose }) {
     if (!raw) return;
     const comps = components.map((c) => ({ sku: String(c.sku || "").trim(), qty: Number(c.qty) || 1 })).filter((c) => c.sku);
     if (comps.length === 0) return;
-    saveAliasMap({ ...aliasMap, [normalizeSku(raw)]: { raw, components: comps } });
+    setAlias(normalizeSku(raw), { raw, components: comps });
     logAudit("alias-add", `Added SKU mapping rule: "${raw}" → ${comps.map((c) => `${c.sku} ×${c.qty}`).join(", ")}`);
     setRawInput("");
     setComponents([{ sku: "", qty: 1 }]);
@@ -1273,7 +1278,7 @@ function AliasManager({ aliasMap, saveAliasMap, inventory, isAdmin, onClose }) {
   );
 }
 
-function StockCountModal({ inventory, saveInventory, onClose, showToast }) {
+function StockCountModal({ inventory, applyInventoryOps, onClose, showToast }) {
   const [step, setStep] = useState("upload"); // upload | mapping | review
   const [target, setTarget] = useState("qtyNew"); // qtyNew | qtyReturn
   const [note, setNote] = useState("");
@@ -1344,14 +1349,14 @@ function StockCountModal({ inventory, saveInventory, onClose, showToast }) {
   };
 
   const applyCount = () => {
-    const map = new Map(inventory.map((x) => [x.sku, { ...x }]));
-    includedRows.forEach((row) => {
-      const cur = map.get(row.sku) || { sku: row.sku, name: row.name, qtyNew: 0, qtyReturn: 0 };
-      cur[target] = row.countedQty;
-      if (row.name && !cur.name) cur.name = row.name;
-      map.set(row.sku, cur);
-    });
-    saveInventory(Array.from(map.values()));
+    const operations = includedRows.map((row) => ({
+      sku: row.sku,
+      name: row.name,
+      field: target,
+      mode: "set",
+      value: row.countedQty,
+    }));
+    applyInventoryOps(operations);
     const label = note.trim() || "Stock count";
     const changedIncluded = includedRows.filter((r) => r.diff !== 0).length;
     logAudit(
@@ -1604,7 +1609,7 @@ function InsightsModal({ inventory, inboundRecords, outboundRecords, onClose }) 
   );
 }
 
-function IgnoredSkuManager({ ignoredSkus, saveIgnoredSkus, onClose }) {
+function IgnoredSkuManager({ ignoredSkus, saveIgnoredSkus, addIgnoredSku, removeIgnoredSku, onClose }) {
   const [input, setInput] = useState("");
   const add = () => {
     const val = input.trim();
@@ -1613,12 +1618,12 @@ function IgnoredSkuManager({ ignoredSkus, saveIgnoredSkus, onClose }) {
       setInput("");
       return;
     }
-    saveIgnoredSkus([...ignoredSkus, val]);
+    addIgnoredSku(val);
     logAudit("ignored-add", `Added ignored code "${val}"`);
     setInput("");
   };
   const remove = (val) => {
-    saveIgnoredSkus(ignoredSkus.filter((s) => s !== val));
+    removeIgnoredSku(val);
     logAudit("ignored-delete", `Removed ignored code "${val}"`);
   };
   return (
@@ -2501,7 +2506,7 @@ function InboundHub({ setView, inboundRecords }) {
 /* ---------------------------------------------------------------
    INBOUND FLOW — shared by "new" and "return" types
 --------------------------------------------------------------- */
-function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInboundRecords, outboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast, setView, isAdmin }) {
+function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboundRecords, saveInboundRecords, addInboundRecord, removeInboundRecord, outboundRecords, aliasMap, saveAliasMap, setAlias, ignoredSkus, showToast, setView, isAdmin }) {
   const isNew = type === "new";
   const accent = isNew ? C.inboundNew : C.inboundReturn;
   const accentSoft = isNew ? C.inboundNewSoft : C.inboundReturnSoft;
@@ -2521,8 +2526,10 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
   const typeRecords = inboundRecords.filter((r) => (r.type || "new") === type);
 
   const performDelete = (record) => {
-    saveInventory(applySignedQty(inventory, record.items, targetField, -1));
-    saveInboundRecords(inboundRecords.filter((r) => r.id !== record.id));
+    applyInventoryOps(
+      record.items.map((it) => ({ sku: it.sku, name: it.name, field: targetField, mode: "delta", value: -(Number(it.qty) || 0) }))
+    );
+    removeInboundRecord(record.id);
     logAudit(
       isNew ? "inbound-new-delete" : "inbound-return-delete",
       `Deleted ${isNew ? "new stock purchase" : "return stock inbound"} record from "${record.fileName}" (${record.supplier}) — reversed ${record.items.length} item rows`
@@ -2640,25 +2647,19 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
       showToast("No valid item rows", "error");
       return;
     }
-    const map = new Map(inventory.map((x) => [x.sku, { ...x }]));
-    cleanItems.forEach((it) => {
-      const sku = it.sku.trim();
-      if (map.has(sku)) {
-        const cur = map.get(sku);
-        cur[targetField] = (Number(cur[targetField]) || 0) + Number(it.qty);
-        if (it.name) cur.name = it.name;
-        map.set(sku, cur);
-      } else {
-        map.set(sku, { sku, name: it.name || sku, qtyNew: 0, qtyReturn: 0, [targetField]: Number(it.qty) });
-      }
-    });
-    saveInventory(Array.from(map.values()));
+    applyInventoryOps(
+      cleanItems.map((it) => ({
+        sku: it.sku.trim(),
+        name: it.name,
+        field: targetField,
+        mode: "delta",
+        value: Number(it.qty) || 0,
+      }))
+    );
 
     // Teach the alias table from any rows the person mapped by hand — grouped
     // by mappedFrom so a bundle (one raw SKU → several different components)
     // saves as a single multi-component rule instead of overwriting itself.
-    const nextAliases = { ...aliasMap };
-    let aliasChanged = false;
     const mapGroups = new Map();
     cleanItems.forEach((it) => {
       if (!it.mappedFrom) return;
@@ -2667,17 +2668,13 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
       mapGroups.get(norm).components.push({ sku: it.sku.trim(), qty: Number(it.qtyMultiplier) || 1 });
     });
     mapGroups.forEach((val, norm) => {
-      const existing = nextAliases[norm] ? aliasComponents(nextAliases[norm]) : null;
+      const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
         !existing ||
         existing.length !== val.components.length ||
         existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) {
-        nextAliases[norm] = { raw: val.raw, components: val.components };
-        aliasChanged = true;
-      }
+      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
     });
-    if (aliasChanged) saveAliasMap(nextAliases);
 
     const record = {
       id: Date.now().toString(),
@@ -2691,7 +2688,7 @@ function InboundFlow({ type, inventory, saveInventory, inboundRecords, saveInbou
       totalAmount: Number(draft.totalAmount) || cleanItems.reduce((s, i) => s + i.qty * i.unitPrice, 0),
       type,
     };
-    saveInboundRecords([record, ...inboundRecords]);
+    addInboundRecord(record);
     logAudit(
       isNew ? "inbound-new-confirm" : "inbound-return-confirm",
       `${isNew ? "New stock purchase" : "Return stock inbound"} confirmed: ${cleanItems.length} item rows from "${draft.fileName}" (${record.supplier})`
@@ -2878,7 +2875,7 @@ function OutboundHub({ setView, outboundRecords }) {
 /* ---------------------------------------------------------------
    OUTBOUND — Amazon FBA Shipment
 --------------------------------------------------------------- */
-function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, saveOutboundRecords, inboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast, isAdmin }) {
+function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps, outboundRecords, saveOutboundRecords, addOutboundRecord, removeOutboundRecord, inboundRecords, aliasMap, saveAliasMap, setAlias, ignoredSkus, showToast, isAdmin }) {
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState(null); // + shipmentId, shipmentName, boxes
   const [excelPending, setExcelPending] = useState(null);
@@ -2890,8 +2887,8 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
 
   const performDelete = (record) => {
     const field = record.source === "New Stock" ? "qtyNew" : "qtyReturn";
-    saveInventory(applySignedQty(inventory, record.items, field, 1));
-    saveOutboundRecords(outboundRecords.filter((r) => r.id !== record.id));
+    applyInventoryOps(record.items.map((it) => ({ sku: it.sku, name: it.name, field, mode: "delta", value: Number(it.qty) || 0 })));
+    removeOutboundRecord(record.id);
     logAudit("outbound-fba-delete", `Deleted FBA shipment ${record.shipmentId} — reversed ${record.items.length} item rows`);
     setDeleteTarget(null);
     showToast("Record deleted, inventory reversed");
@@ -3002,27 +2999,19 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
     showToast(`Generated ${resolved.length} item rows from the spreadsheet — please review`);
   };
 
-  const confirmOutbound = () => {
+  const confirmOutbound = async () => {
     const cleanItems = draft.items.filter((it) => it.sku.trim() && Number(it.qty) > 0);
     if (cleanItems.length === 0) {
       showToast("No valid item rows", "error");
       return;
     }
     const field = draft.source;
-    const map = new Map(inventory.map((x) => [x.sku, { ...x }]));
-    let shortage = false;
-    cleanItems.forEach((it) => {
-      const sku = it.sku.trim();
-      const cur = map.get(sku) || { sku, name: it.name || sku, qtyNew: 0, qtyReturn: 0 };
-      const remaining = (Number(cur[field]) || 0) - Number(it.qty);
-      if (remaining < 0) shortage = true;
-      cur[field] = remaining;
-      map.set(sku, cur);
-    });
-    saveInventory(Array.from(map.values()));
+    const affectedSkus = new Set(cleanItems.map((it) => it.sku.trim()));
+    const freshInventory = await applyInventoryOps(
+      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field, mode: "delta", value: -(Number(it.qty) || 0) }))
+    );
+    const shortage = (freshInventory || []).some((x) => affectedSkus.has(x.sku) && Number(x[field]) < 0);
 
-    const nextAliases = { ...aliasMap };
-    let aliasChanged = false;
     const mapGroups = new Map();
     cleanItems.forEach((it) => {
       if (!it.mappedFrom) return;
@@ -3031,17 +3020,13 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
       mapGroups.get(norm).components.push({ sku: it.sku.trim(), qty: Number(it.qtyMultiplier) || 1 });
     });
     mapGroups.forEach((val, norm) => {
-      const existing = nextAliases[norm] ? aliasComponents(nextAliases[norm]) : null;
+      const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
         !existing ||
         existing.length !== val.components.length ||
         existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) {
-        nextAliases[norm] = { raw: val.raw, components: val.components };
-        aliasChanged = true;
-      }
+      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
     });
-    if (aliasChanged) saveAliasMap(nextAliases);
 
     const record = {
       id: Date.now().toString(),
@@ -3057,7 +3042,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, outboundRecords, s
       items: cleanItems,
       type: "fba",
     };
-    saveOutboundRecords([record, ...outboundRecords]);
+    addOutboundRecord(record);
     logAudit("outbound-fba-confirm", `FBA shipment ${record.shipmentId} confirmed: ${cleanItems.length} item rows, ${record.boxes} boxes`);
     setDraft(null);
     showToast(shortage ? "Shipment confirmed, but some items are now negative — please check" : "Shipment confirmed, inventory updated", shortage ? "error" : "success");
@@ -3280,7 +3265,7 @@ function FbaMonthlyReportModal({ records, onClose }) {
 /* ---------------------------------------------------------------
    OUTBOUND — Order Fulfillment
 --------------------------------------------------------------- */
-function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords, saveOutboundRecords, inboundRecords, aliasMap, saveAliasMap, ignoredSkus, showToast, isAdmin }) {
+function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOps, outboundRecords, saveOutboundRecords, addOutboundRecord, removeOutboundRecord, inboundRecords, aliasMap, saveAliasMap, setAlias, ignoredSkus, showToast, isAdmin }) {
   const [busy, setBusy] = useState(false);
   const [draft, setDraft] = useState(null);
   const [excelPending, setExcelPending] = useState(null);
@@ -3291,8 +3276,8 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
 
   const performDelete = (record) => {
     const field = record.source === "New Stock" ? "qtyNew" : "qtyReturn";
-    saveInventory(applySignedQty(inventory, record.items, field, 1));
-    saveOutboundRecords(outboundRecords.filter((r) => r.id !== record.id));
+    applyInventoryOps(record.items.map((it) => ({ sku: it.sku, name: it.name, field, mode: "delta", value: Number(it.qty) || 0 })));
+    removeOutboundRecord(record.id);
     logAudit("outbound-order-delete", `Deleted order fulfillment record from "${record.fileName}" (${record.platform}) — reversed ${record.items.length} item rows`);
     setDeleteTarget(null);
     showToast("Record deleted, inventory reversed");
@@ -3413,27 +3398,19 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
     showToast(`Generated ${resolved.length} item rows from the spreadsheet — please review`);
   };
 
-  const confirmOutbound = () => {
+  const confirmOutbound = async () => {
     const cleanItems = draft.items.filter((it) => it.sku.trim() && Number(it.qty) > 0);
     if (cleanItems.length === 0) {
       showToast("No valid item rows", "error");
       return;
     }
     const field = draft.source;
-    const map = new Map(inventory.map((x) => [x.sku, { ...x }]));
-    let shortage = false;
-    cleanItems.forEach((it) => {
-      const sku = it.sku.trim();
-      const cur = map.get(sku) || { sku, name: it.name || sku, qtyNew: 0, qtyReturn: 0 };
-      const remaining = (Number(cur[field]) || 0) - Number(it.qty);
-      if (remaining < 0) shortage = true;
-      cur[field] = remaining;
-      map.set(sku, cur);
-    });
-    saveInventory(Array.from(map.values()));
+    const affectedSkus = new Set(cleanItems.map((it) => it.sku.trim()));
+    const freshInventory = await applyInventoryOps(
+      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field, mode: "delta", value: -(Number(it.qty) || 0) }))
+    );
+    const shortage = (freshInventory || []).some((x) => affectedSkus.has(x.sku) && Number(x[field]) < 0);
 
-    const nextAliases = { ...aliasMap };
-    let aliasChanged = false;
     const mapGroups = new Map();
     cleanItems.forEach((it) => {
       if (!it.mappedFrom) return;
@@ -3442,17 +3419,13 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
       mapGroups.get(norm).components.push({ sku: it.sku.trim(), qty: Number(it.qtyMultiplier) || 1 });
     });
     mapGroups.forEach((val, norm) => {
-      const existing = nextAliases[norm] ? aliasComponents(nextAliases[norm]) : null;
+      const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
         !existing ||
         existing.length !== val.components.length ||
         existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) {
-        nextAliases[norm] = { raw: val.raw, components: val.components };
-        aliasChanged = true;
-      }
+      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
     });
-    if (aliasChanged) saveAliasMap(nextAliases);
 
     const record = {
       id: Date.now().toString(),
@@ -3465,7 +3438,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, outboundRecords,
       items: cleanItems,
       type: "order",
     };
-    saveOutboundRecords([record, ...outboundRecords]);
+    addOutboundRecord(record);
     logAudit("outbound-order-confirm", `Order fulfillment confirmed: ${cleanItems.length} item rows from "${draft.fileName}" (${record.platform})`);
     setDraft(null);
     showToast(shortage ? "Outbound confirmed, but some items are now negative — please check" : "Outbound confirmed, inventory updated", shortage ? "error" : "success");
@@ -3827,6 +3800,10 @@ export default function WarehouseApp() {
     })();
   }, [auth]);
 
+  // Direct full-array overwrite — only safe for hydrating from a fresh
+  // server load. Every actual mutation should go through
+  // applyInventoryOps below instead, which never clobbers SKUs it
+  // doesn't touch even if this browser's copy of inventory is stale.
   const saveInventory = useCallback(async (next) => {
     setInventory(next);
     try {
@@ -3837,6 +3814,28 @@ export default function WarehouseApp() {
     }
   }, [showToast]);
 
+  // Atomic, server-computed inventory changes — the only path components
+  // should use to add/subtract/set/delete specific SKUs. See the
+  // /api/inventory/adjust handler in server.js for why this exists.
+  const applyInventoryOps = useCallback(async (operations) => {
+    if (!operations || operations.length === 0) return inventory;
+    try {
+      const data = await apiPost("/api/inventory/adjust", { operations });
+      if (data && data.inventory) {
+        setInventory(data.inventory);
+        return data.inventory;
+      }
+      throw new Error(data && data.error ? data.error : "adjust failed");
+    } catch (e) {
+      showToast("Failed to update inventory — please retry", "error");
+      return inventory;
+    }
+  }, [inventory, showToast]);
+
+  // These four still exist for hydrating local state after the initial
+  // load from the server. Every actual add/remove should use the atomic
+  // per-item helpers below instead — see the /api/records, /api/aliases,
+  // /api/ignored-skus endpoints in server.js for why.
   const saveInboundRecords = useCallback(async (next) => {
     setInboundRecords(next);
     try {
@@ -3874,6 +3873,86 @@ export default function WarehouseApp() {
       if (!ok) throw new Error();
     } catch (e) {
       showToast("Failed to save ignored codes", "error");
+    }
+  }, [showToast]);
+
+  const addInboundRecord = useCallback(async (record) => {
+    try {
+      const data = await apiPost("/api/records/inbound-records/add", { record });
+      if (data && data.records) setInboundRecords(data.records);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to save the inbound record", "error");
+    }
+  }, [showToast]);
+
+  const removeInboundRecord = useCallback(async (id) => {
+    try {
+      const data = await apiPost("/api/records/inbound-records/remove", { id });
+      if (data && data.records) setInboundRecords(data.records);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to delete the inbound record", "error");
+    }
+  }, [showToast]);
+
+  const addOutboundRecord = useCallback(async (record) => {
+    try {
+      const data = await apiPost("/api/records/outbound-records/add", { record });
+      if (data && data.records) setOutboundRecords(data.records);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to save the outbound record", "error");
+    }
+  }, [showToast]);
+
+  const removeOutboundRecord = useCallback(async (id) => {
+    try {
+      const data = await apiPost("/api/records/outbound-records/remove", { id });
+      if (data && data.records) setOutboundRecords(data.records);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to delete the outbound record", "error");
+    }
+  }, [showToast]);
+
+  const setAlias = useCallback(async (key, value) => {
+    try {
+      const data = await apiPost("/api/aliases/set", { key, value });
+      if (data && data.aliases) setSkuAliases(data.aliases);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to save the SKU mapping rule", "error");
+    }
+  }, [showToast]);
+
+  const deleteAlias = useCallback(async (key) => {
+    try {
+      const data = await apiPost("/api/aliases/delete", { key });
+      if (data && data.aliases) setSkuAliases(data.aliases);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to delete the SKU mapping rule", "error");
+    }
+  }, [showToast]);
+
+  const addIgnoredSku = useCallback(async (value) => {
+    try {
+      const data = await apiPost("/api/ignored-skus/add", { value });
+      if (data && data.items) setIgnoredSkus(data.items);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to save the ignored code", "error");
+    }
+  }, [showToast]);
+
+  const removeIgnoredSku = useCallback(async (value) => {
+    try {
+      const data = await apiPost("/api/ignored-skus/remove", { value });
+      if (data && data.items) setIgnoredSkus(data.items);
+      else throw new Error();
+    } catch (e) {
+      showToast("Failed to delete the ignored code", "error");
     }
   }, [showToast]);
 
@@ -3928,11 +4007,16 @@ export default function WarehouseApp() {
           setView={setView}
           inventory={inventory}
           saveInventory={saveInventory}
+          applyInventoryOps={applyInventoryOps}
           showToast={showToast}
           aliasMap={skuAliases}
           saveAliasMap={saveAliasMap}
+          setAlias={setAlias}
+          deleteAlias={deleteAlias}
           ignoredSkus={ignoredSkus}
           saveIgnoredSkus={saveIgnoredSkus}
+          addIgnoredSku={addIgnoredSku}
+          removeIgnoredSku={removeIgnoredSku}
           inboundRecords={inboundRecords}
           outboundRecords={outboundRecords}
           isAdmin={isAdmin}
@@ -3944,11 +4028,15 @@ export default function WarehouseApp() {
           type={view === "inbound-new" ? "new" : "return"}
           inventory={inventory}
           saveInventory={saveInventory}
+          applyInventoryOps={applyInventoryOps}
           inboundRecords={inboundRecords}
           saveInboundRecords={saveInboundRecords}
+          addInboundRecord={addInboundRecord}
+          removeInboundRecord={removeInboundRecord}
           outboundRecords={outboundRecords}
           aliasMap={skuAliases}
           saveAliasMap={saveAliasMap}
+          setAlias={setAlias}
           ignoredSkus={ignoredSkus}
           showToast={showToast}
           setView={setView}
@@ -3961,11 +4049,15 @@ export default function WarehouseApp() {
           setView={setView}
           inventory={inventory}
           saveInventory={saveInventory}
+          applyInventoryOps={applyInventoryOps}
           outboundRecords={outboundRecords}
           saveOutboundRecords={saveOutboundRecords}
+          addOutboundRecord={addOutboundRecord}
+          removeOutboundRecord={removeOutboundRecord}
           inboundRecords={inboundRecords}
           aliasMap={skuAliases}
           saveAliasMap={saveAliasMap}
+          setAlias={setAlias}
           ignoredSkus={ignoredSkus}
           showToast={showToast}
           isAdmin={isAdmin}
@@ -3975,11 +4067,15 @@ export default function WarehouseApp() {
           setView={setView}
           inventory={inventory}
           saveInventory={saveInventory}
+          applyInventoryOps={applyInventoryOps}
           outboundRecords={outboundRecords}
           saveOutboundRecords={saveOutboundRecords}
+          addOutboundRecord={addOutboundRecord}
+          removeOutboundRecord={removeOutboundRecord}
           inboundRecords={inboundRecords}
           aliasMap={skuAliases}
           saveAliasMap={saveAliasMap}
+          setAlias={setAlias}
           ignoredSkus={ignoredSkus}
           showToast={showToast}
           isAdmin={isAdmin}
