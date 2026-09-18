@@ -906,6 +906,14 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
   const [showInsights, setShowInsights] = useState(false);
   const [showStockCount, setShowStockCount] = useState(false);
   const [showBrandImport, setShowBrandImport] = useState(false);
+  const [sortMode, setSortMode] = useState("sku"); // sku | qty-desc | qty-asc
+  const [deleteConfirmSku, setDeleteConfirmSku] = useState(null);
+
+  const sortItems = (arr, field) => {
+    if (sortMode === "qty-desc") return [...arr].sort((a, b) => (b[field] || 0) - (a[field] || 0));
+    if (sortMode === "qty-asc") return [...arr].sort((a, b) => (a[field] || 0) - (b[field] || 0));
+    return [...arr].sort((a, b) => a.sku.localeCompare(b.sku));
+  };
 
   const brands = Array.from(new Set(inventory.map((x) => (x.brand || "").trim()).filter(Boolean))).sort();
 
@@ -954,7 +962,10 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
     showToast("Item deleted");
   };
 
-  const Section = ({ label, color, field }) => (
+  const Section = ({ label, color, field }) => {
+    const baseList = query.trim() ? filtered : filtered.filter((x) => (x[field] || 0) !== 0);
+    const visible = sortItems(baseList, field);
+    return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 5, overflow: "hidden" }}>
       <div
         style={{
@@ -972,12 +983,10 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
         </span>
       </div>
       <div style={{ maxHeight: 560, overflowY: "auto" }}>
-        {filtered.filter((x) => (x[field] || 0) !== 0).length === 0 && (
+        {visible.length === 0 && (
           <div style={{ padding: 18, fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI }}>No items with stock</div>
         )}
-        {filtered
-          .filter((x) => (x[field] || 0) !== 0)
-          .map((x) => (
+        {visible.map((x) => (
           <div
             key={x.sku}
             style={{
@@ -997,16 +1006,22 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
               </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-              <span style={{ fontFamily: FONT_MONO, fontWeight: 700, fontSize: 15, color: x[field] < 0 ? C.danger : C.ink }}>{x[field]}</span>
+              <span style={{ fontFamily: FONT_MONO, fontWeight: 700, fontSize: 15, color: x[field] < 0 ? C.danger : C.ink }}>{x[field] || 0}</span>
               <button onClick={() => openEdit(x)} style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft, display: "flex" }}>
                 <Pencil size={13} />
               </button>
+              {isAdmin && (
+                <button onClick={() => setDeleteConfirmSku(x.sku)} style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft, display: "flex" }}>
+                  <Trash2 size={13} />
+                </button>
+              )}
             </div>
           </div>
         ))}
       </div>
     </div>
   );
+  };
 
   return (
     <div>
@@ -1038,6 +1053,15 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
               <option key={b} value={b}>{b}</option>
             ))}
           </select>
+          <select
+            value={sortMode}
+            onChange={(e) => setSortMode(e.target.value)}
+            style={{ ...inputStyle, width: 170 }}
+          >
+            <option value="sku">Sort: SKU (A–Z)</option>
+            <option value="qty-desc">Sort: Qty (High–Low)</option>
+            <option value="qty-asc">Sort: Qty (Low–High)</option>
+          </select>
           <Btn onClick={openNew} color={C.inventory} icon={Plus}>
             Add / Adjust
           </Btn>
@@ -1065,8 +1089,8 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
           <Btn
             onClick={() => {
               const rows = [
-                ["SKU", "Product name", "New stock (A)", "Return stock (B)"],
-                ...inventory.map((x) => [x.sku, x.name, x.qtyNew, x.qtyReturn]),
+                ["SKU", "Product name", "Brand", "New stock (A)", "Return stock (B)"],
+                ...inventory.map((x) => [x.sku, x.name, x.brand || "", x.qtyNew, x.qtyReturn]),
               ];
               downloadCSV(rows, `inventory-${todayISO()}.csv`);
             }}
@@ -1161,6 +1185,30 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
       )}
       {showBrandImport && (
         <BrandImportModal inventory={inventory} applyInventoryOps={applyInventoryOps} showToast={showToast} onClose={() => setShowBrandImport(false)} />
+      )}
+      {deleteConfirmSku && (
+        <Modal title="Delete this SKU?" accent={C.danger} onClose={() => setDeleteConfirmSku(null)}>
+          <div style={{ fontSize: 13.5, fontFamily: FONT_UI, color: C.ink, lineHeight: 1.6, marginBottom: 16 }}>
+            This removes <strong>{deleteConfirmSku}</strong> from inventory entirely (both New and Return stock).
+            Useful for cleaning up a SKU that was created by mistake — e.g. a mapping error. This doesn't touch any
+            past inbound/outbound records, only the current stock line.
+          </div>
+          <div style={{ display: "flex", justifyContent: "flex-end", gap: 10 }}>
+            <Btn variant="outline" color={C.inkSoft} onClick={() => setDeleteConfirmSku(null)}>
+              Cancel
+            </Btn>
+            <Btn
+              color={C.danger}
+              icon={Trash2}
+              onClick={() => {
+                removeItem(deleteConfirmSku);
+                setDeleteConfirmSku(null);
+              }}
+            >
+              Delete SKU
+            </Btn>
+          </div>
+        </Modal>
       )}
     </div>
   );
@@ -1522,14 +1570,60 @@ function StockCountModal({ inventory, applyInventoryOps, aliasMap, setAlias, ign
   const [countedItems, setCountedItems] = useState([]); // [{ sku, name, countedQty }] — after resolution
   const [excluded, setExcluded] = useState(new Set()); // skus to skip when applying
 
+  const finishResolving = (items) => {
+    const rawFinal = items
+      .filter((it) => it.sku.trim() && Number(it.qty) > 0)
+      .map((it) => ({ sku: it.sku.trim(), name: it.name, countedQty: Number(it.qty), mappedFrom: it.mappedFrom, qtyMultiplier: it.qtyMultiplier }));
+    // Teach any hand-mapped rules, same convention as inbound/outbound.
+    const mapGroups = new Map();
+    rawFinal.forEach((it) => {
+      if (!it.mappedFrom) return;
+      const norm = normalizeSku(it.mappedFrom);
+      if (!mapGroups.has(norm)) mapGroups.set(norm, { raw: it.mappedFrom, components: [] });
+      mapGroups.get(norm).components.push({ sku: it.sku, qty: Number(it.qtyMultiplier) || 1 });
+    });
+    mapGroups.forEach((val, norm) => {
+      const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
+      const changed =
+        !existing ||
+        existing.length !== val.components.length ||
+        existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
+      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
+    });
+
+    // A SKU can show up more than once — e.g. it's a bundle component AND was
+    // also counted on its own elsewhere in the sheet. Sum those contributions
+    // into a single counted quantity instead of letting one silently
+    // overwrite the other.
+    const aggMap = new Map();
+    rawFinal.forEach((it) => {
+      const norm = normalizeSku(it.sku);
+      const cur = aggMap.get(norm) || { sku: it.sku, name: it.name, countedQty: 0 };
+      cur.countedQty += it.countedQty;
+      if (it.name && !cur.name) cur.name = it.name;
+      aggMap.set(norm, cur);
+    });
+
+    setCountedItems(Array.from(aggMap.values()));
+    setExcluded(new Set());
+    setStep("review");
+  };
+
   const startResolving = (rawItems) => {
     // rawItems: [{ sku, name, countedQty }] — reuse the same SKU-mapping engine
     // as inbound/outbound (bundle expansion, learned aliases, unresolved flags)
     // by treating the counted quantity as the "qty" resolveSkus expects.
     const asQtyItems = rawItems.map((it) => ({ sku: it.sku, name: it.name, qty: it.countedQty, unitPrice: 0 }));
     const resolved = resolveSkus(asQtyItems, inventory, aliasMap, ignoredSkus);
-    setResolveItems(resolved);
-    setStep("resolve");
+    if (resolved.some((it) => it.needsMapping)) {
+      // Something needs a human decision — stop and show the mapping step.
+      setResolveItems(resolved);
+      setStep("resolve");
+    } else {
+      // Everything matched cleanly (including any bundle expansion) — skip
+      // straight to the diff, same as before this feature existed.
+      finishResolving(resolved);
+    }
   };
 
   const handleFile = async (file) => {
@@ -1568,30 +1662,7 @@ function StockCountModal({ inventory, applyInventoryOps, aliasMap, setAlias, ign
     startResolving(items);
   };
 
-  const confirmResolution = () => {
-    const finalItems = resolveItems
-      .filter((it) => it.sku.trim() && Number(it.qty) > 0)
-      .map((it) => ({ sku: it.sku.trim(), name: it.name, countedQty: Number(it.qty), mappedFrom: it.mappedFrom, qtyMultiplier: it.qtyMultiplier }));
-    // Teach any hand-mapped rules, same convention as inbound/outbound.
-    const mapGroups = new Map();
-    finalItems.forEach((it) => {
-      if (!it.mappedFrom) return;
-      const norm = normalizeSku(it.mappedFrom);
-      if (!mapGroups.has(norm)) mapGroups.set(norm, { raw: it.mappedFrom, components: [] });
-      mapGroups.get(norm).components.push({ sku: it.sku, qty: Number(it.qtyMultiplier) || 1 });
-    });
-    mapGroups.forEach((val, norm) => {
-      const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
-      const changed =
-        !existing ||
-        existing.length !== val.components.length ||
-        existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
-    });
-    setCountedItems(finalItems);
-    setExcluded(new Set());
-    setStep("review");
-  };
+  const confirmResolution = () => finishResolving(resolveItems);
 
   const diffRows = countedItems.map((it) => {
     const existing = inventory.find((x) => normalizeSku(x.sku) === normalizeSku(it.sku));
@@ -2188,6 +2259,43 @@ function DuplicateFileWarning({ fileName, match, onCancel, onProceed }) {
 /* ---------------------------------------------------------------
    Editable extracted-items table with SKU-mapping controls
 --------------------------------------------------------------- */
+function SourcePicker({ value, onChange, accent }) {
+  const options = [
+    { value: "qtyNew", label: "New Stock (A)" },
+    { value: "qtyReturn", label: "Return Stock (B)" },
+  ];
+  return (
+    <div style={{ marginBottom: 14 }}>
+      <div style={{ fontSize: 12, color: C.inkSoft, marginBottom: 6, fontFamily: FONT_UI, fontWeight: 700 }}>
+        Which stock is this shipment from? <span style={{ color: C.danger }}>*</span>
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        {options.map((opt) => (
+          <button
+            key={opt.value}
+            onClick={() => onChange(opt.value)}
+            style={{
+              flex: 1,
+              padding: "12px 14px",
+              borderRadius: 5,
+              border: `2px solid ${value === opt.value ? accent : C.border}`,
+              background: value === opt.value ? accent : C.surface,
+              color: value === opt.value ? "#fff" : C.ink,
+              fontWeight: 700,
+              fontSize: 13.5,
+              fontFamily: FONT_UI,
+              cursor: "pointer",
+              transition: "all 0.12s ease",
+            }}
+          >
+            {opt.label}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
   const update = (i, field, val) => {
     const next = [...items];
@@ -2637,28 +2745,43 @@ function RecordsList({ records, dateField, showAmount, sourceLabel, isAdmin, onD
   );
 }
 
-function MonthlyReportModal({ records, onClose, title }) {
+function MonthlyReportModal({ records, onClose, title, inventory = [] }) {
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
   const shift = (delta) => {
     const [y, m] = month.split("-").map(Number);
     const d = new Date(y, m - 1 + delta, 1);
     setMonth(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
   };
+  const brandOf = (sku) => {
+    const inv = inventory.find((x) => normalizeSku(x.sku) === normalizeSku(sku));
+    return (inv && inv.brand) || "Unspecified";
+  };
   const monthRecords = records.filter((r) => monthKey(r.invoiceDate || r.date) === month);
   const totalAmount = monthRecords.reduce((s, r) => s + (Number(r.totalAmount) || 0), 0);
   const bySku = new Map();
+  const byBrand = new Map();
   monthRecords.forEach((r) =>
     r.items.forEach((it) => {
       const cur = bySku.get(it.sku) || { sku: it.sku, name: it.name, qty: 0, amount: 0 };
       cur.qty += Number(it.qty) || 0;
       cur.amount += (Number(it.qty) || 0) * (Number(it.unitPrice) || 0);
       bySku.set(it.sku, cur);
+
+      const brand = brandOf(it.sku);
+      const curB = byBrand.get(brand) || { brand, qty: 0, amount: 0 };
+      curB.qty += Number(it.qty) || 0;
+      curB.amount += (Number(it.qty) || 0) * (Number(it.unitPrice) || 0);
+      byBrand.set(brand, curB);
     })
   );
   const skuRows = Array.from(bySku.values()).sort((a, b) => b.amount - a.amount);
+  const brandRows = Array.from(byBrand.values()).sort((a, b) => b.amount - a.amount);
 
   const exportCSV = () => {
     const rows = [["SKU", "Product name", "Qty", "Amount"], ...skuRows.map((r) => [r.sku, r.name, r.qty, r.amount.toFixed(2)])];
+    rows.push([]);
+    rows.push(["Brand", "Total qty", "Total amount"]);
+    brandRows.forEach((r) => rows.push([r.brand, r.qty, r.amount.toFixed(2)]));
     rows.push([]);
     rows.push(["Records", monthRecords.length]);
     rows.push(["Total amount", totalAmount.toFixed(2)]);
@@ -2682,6 +2805,26 @@ function MonthlyReportModal({ records, onClose, title }) {
         <StatBox label="Total value" value={`€${fmtMoney(totalAmount)}`} />
         <StatBox label="SKUs" value={skuRows.length} />
       </div>
+
+      {brandRows.length > 0 && (
+        <>
+          <div style={{ fontSize: 13, fontWeight: 700, fontFamily: FONT_UI, color: C.ink, marginBottom: 8 }}>By brand</div>
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, overflow: "hidden", marginBottom: 16 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1.4fr 0.7fr 0.9fr", padding: "7px 12px", background: C.surfaceSoft, fontSize: 11, fontWeight: 700, color: C.inkSoft, fontFamily: FONT_UI }}>
+              <div>Brand</div>
+              <div>Total qty</div>
+              <div>Total amount</div>
+            </div>
+            {brandRows.map((r) => (
+              <div key={r.brand} style={{ display: "grid", gridTemplateColumns: "1.4fr 0.7fr 0.9fr", padding: "6px 12px", borderTop: `1px solid ${C.surfaceSoft}`, fontSize: 12.5, fontFamily: FONT_UI }}>
+                <div>{r.brand}</div>
+                <div style={{ fontFamily: FONT_MONO }}>{r.qty}</div>
+                <div style={{ fontFamily: FONT_MONO }}>€{fmtMoney(r.amount)}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       {skuRows.length === 0 ? (
         <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI, padding: 12 }}>No records this month</div>
@@ -3081,6 +3224,7 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
         <MonthlyReportModal
           records={typeRecords}
           title={isNew ? "Monthly Report — New Stock Purchases" : "Monthly Report — Return Stock Inbound"}
+          inventory={inventory}
           onClose={() => setShowReport(false)}
         />
       )}
@@ -3209,7 +3353,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
             shipTo: meta.shipTo || "",
             boxes: meta.boxes || 0,
             shipDate: todayISO(),
-            source: "qtyNew",
+            source: null,
             items: resolved,
             fileName: file.name,
             fileHash: hash,
@@ -3245,7 +3389,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
         shipTo: "",
         boxes: 0,
         shipDate: extracted.ship_date || todayISO(),
-        source: "qtyNew",
+        source: null,
         items: resolveSkus(rawItems, inventory, aliasMap, ignoredSkus),
         fileName: file.name,
         fileHash: hash,
@@ -3253,7 +3397,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
       showToast("Extraction complete — please review and confirm");
     } catch (e) {
       showToast(e.message || "Recognition failed — please retry or enter manually", "error");
-      setDraft({ shipmentId: "", shipmentName: "", shipTo: "", boxes: 0, shipDate: todayISO(), source: "qtyNew", items: [{ sku: "", name: "", qty: 1 }], fileName: file.name, fileHash: hash });
+      setDraft({ shipmentId: "", shipmentName: "", shipTo: "", boxes: 0, shipDate: todayISO(), source: null, items: [{ sku: "", name: "", qty: 1 }], fileName: file.name, fileHash: hash });
     } finally {
       setBusy(false);
     }
@@ -3275,7 +3419,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
       shipTo: meta.shipTo || "",
       boxes: meta.boxes || 0,
       shipDate: todayISO(),
-      source: "qtyNew",
+      source: null,
       items: resolved,
       fileName: excelPending.fileName,
       fileHash: excelPending.fileHash,
@@ -3285,6 +3429,10 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
   };
 
   const confirmOutbound = async () => {
+    if (!draft.source) {
+      showToast("Please choose New Stock or Return Stock first", "error");
+      return;
+    }
     const cleanItems = draft.items.filter((it) => it.sku.trim() && Number(it.qty) > 0);
     if (cleanItems.length === 0) {
       showToast("No valid item rows", "error");
@@ -3356,6 +3504,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
               </div>
               <Stamp label="Pending review" color={C.amber} bg={C.amberSoft} />
             </div>
+            <SourcePicker value={draft.source} onChange={(v) => setDraft({ ...draft, source: v })} accent={C.outbound} />
             <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
               <Field label="Shipment ID" style={{ flex: 1, minWidth: 160 }}>
                 <input value={draft.shipmentId} onChange={(e) => setDraft({ ...draft, shipmentId: e.target.value })} style={{ ...inputStyle, fontFamily: FONT_MONO }} />
@@ -3366,19 +3515,13 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
               <Field label="Boxes" style={{ width: 90 }}>
                 <input type="number" value={draft.boxes} onChange={(e) => setDraft({ ...draft, boxes: e.target.value })} style={inputStyle} />
               </Field>
-              <Field label="Outbound source" style={{ width: 150 }}>
-                <select value={draft.source} onChange={(e) => setDraft({ ...draft, source: e.target.value })} style={inputStyle}>
-                  <option value="qtyNew">New Stock (A)</option>
-                  <option value="qtyReturn">Return Stock (B)</option>
-                </select>
-              </Field>
             </div>
             <ItemsEditor items={draft.items} setItems={(items) => setDraft({ ...draft, items })} showPrice={false} inventory={inventory} />
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 14 }}>
               <Btn variant="outline" color={C.inkSoft} onClick={() => setDraft(null)}>
                 Cancel
               </Btn>
-              <Btn color={C.outbound} icon={CheckCircle2} onClick={confirmOutbound}>
+              <Btn color={C.outbound} icon={CheckCircle2} onClick={confirmOutbound} disabled={!draft.source}>
                 Confirm Shipment
               </Btn>
             </div>
@@ -3425,7 +3568,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
         />
       )}
 
-      {showReport && <FbaMonthlyReportModal records={typeRecords} onClose={() => setShowReport(false)} />}
+      {showReport && <FbaMonthlyReportModal records={typeRecords} inventory={inventory} onClose={() => setShowReport(false)} />}
 
       {deleteTarget && (
         <DeleteRecordConfirm record={deleteTarget} onCancel={() => setDeleteTarget(null)} onConfirm={() => performDelete(deleteTarget)} />
@@ -3434,17 +3577,22 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
   );
 }
 
-function FbaMonthlyReportModal({ records, onClose }) {
+function FbaMonthlyReportModal({ records, onClose, inventory = [] }) {
   const [month, setMonth] = useState(new Date().toISOString().slice(0, 7));
   const shift = (delta) => {
     const [y, m] = month.split("-").map(Number);
     const d = new Date(y, m - 1 + delta, 1);
     setMonth(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`);
   };
+  const brandOf = (sku) => {
+    const inv = inventory.find((x) => normalizeSku(x.sku) === normalizeSku(sku));
+    return (inv && inv.brand) || "Unspecified";
+  };
   const monthRecords = records.filter((r) => monthKey(r.shipDate || r.date) === month);
 
   // Group by Shipment ID
   const shipmentsMap = new Map();
+  const byBrand = new Map();
   monthRecords.forEach((r) => {
     const key = r.shipmentId || r.id;
     const cur = shipmentsMap.get(key) || {
@@ -3458,12 +3606,18 @@ function FbaMonthlyReportModal({ records, onClose }) {
       const c = cur.items.get(it.sku) || { sku: it.sku, name: it.name, qty: 0 };
       c.qty += Number(it.qty) || 0;
       cur.items.set(it.sku, c);
+
+      const brand = brandOf(it.sku);
+      const curB = byBrand.get(brand) || { brand, qty: 0 };
+      curB.qty += Number(it.qty) || 0;
+      byBrand.set(brand, curB);
     });
     shipmentsMap.set(key, cur);
   });
   const shipments = Array.from(shipmentsMap.values())
     .map((s) => ({ ...s, items: Array.from(s.items.values()) }))
     .sort((a, b) => (a.shipDate || "").localeCompare(b.shipDate || ""));
+  const brandRows = Array.from(byBrand.values()).sort((a, b) => b.qty - a.qty);
 
   const totalBoxes = shipments.reduce((s, x) => s + x.boxes, 0);
   const totalUnits = shipments.reduce((s, x) => s + x.items.reduce((a, i) => a + i.qty, 0), 0);
@@ -3475,6 +3629,9 @@ function FbaMonthlyReportModal({ records, onClose }) {
         rows.push([s.shipmentId, s.shipDate || "", it.sku, it.name, it.qty, s.boxes]);
       });
     });
+    rows.push([]);
+    rows.push(["Brand", "Total qty"]);
+    brandRows.forEach((r) => rows.push([r.brand, r.qty]));
     rows.push([]);
     rows.push(["Shipments", shipments.length]);
     rows.push(["Total boxes", totalBoxes]);
@@ -3499,6 +3656,24 @@ function FbaMonthlyReportModal({ records, onClose }) {
         <StatBox label="Total boxes" value={totalBoxes} />
         <StatBox label="Total units" value={totalUnits} />
       </div>
+
+      {brandRows.length > 0 && (
+        <>
+          <div style={{ fontSize: 13, fontWeight: 700, fontFamily: FONT_UI, color: C.ink, marginBottom: 8 }}>By brand</div>
+          <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, overflow: "hidden", marginBottom: 16 }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1.4fr 0.8fr", padding: "7px 12px", background: C.surfaceSoft, fontSize: 11, fontWeight: 700, color: C.inkSoft, fontFamily: FONT_UI }}>
+              <div>Brand</div>
+              <div>Total qty</div>
+            </div>
+            {brandRows.map((r) => (
+              <div key={r.brand} style={{ display: "grid", gridTemplateColumns: "1.4fr 0.8fr", padding: "6px 12px", borderTop: `1px solid ${C.surfaceSoft}`, fontSize: 12.5, fontFamily: FONT_UI }}>
+                <div>{r.brand}</div>
+                <div style={{ fontFamily: FONT_MONO }}>{r.qty}</div>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
 
       {shipments.length === 0 ? (
         <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI, padding: 12 }}>No shipments this month</div>
@@ -3595,7 +3770,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
         setDraft({
           platform: "Amazon",
           shipDate: dateFromFilename(file.name) || todayISO(),
-          source: "qtyNew",
+          source: null,
           items: resolved,
           fileName: file.name,
           fileHash: hash,
@@ -3616,7 +3791,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
           setDraft({
             platform: "",
             shipDate: todayISO(),
-            source: "qtyNew",
+            source: null,
             items: resolved,
             fileName: file.name,
             fileHash: hash,
@@ -3648,7 +3823,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
       setDraft({
         platform: fnMeta?.platform || extracted.platform || "",
         shipDate: fnMeta?.date || extracted.ship_date || todayISO(),
-        source: "qtyNew",
+        source: null,
         items: resolveSkus(rawItems, inventory, aliasMap, ignoredSkus),
         fileName: file.name,
         fileHash: hash,
@@ -3656,7 +3831,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
       showToast("Extraction complete — please review and confirm");
     } catch (e) {
       showToast(e.message || "Recognition failed — please retry or enter manually", "error");
-      setDraft({ platform: "", shipDate: todayISO(), source: "qtyNew", items: [{ sku: "", name: "", qty: 1 }], fileName: file.name, fileHash: hash });
+      setDraft({ platform: "", shipDate: todayISO(), source: null, items: [{ sku: "", name: "", qty: 1 }], fileName: file.name, fileHash: hash });
     } finally {
       setBusy(false);
     }
@@ -3674,7 +3849,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
     setDraft({
       platform: "",
       shipDate: todayISO(),
-      source: "qtyNew",
+      source: null,
       items: resolved,
       fileName: excelPending.fileName,
       fileHash: excelPending.fileHash,
@@ -3684,6 +3859,10 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
   };
 
   const confirmOutbound = async () => {
+    if (!draft.source) {
+      showToast("Please choose New Stock or Return Stock first", "error");
+      return;
+    }
     const cleanItems = draft.items.filter((it) => it.sku.trim() && Number(it.qty) > 0);
     if (cleanItems.length === 0) {
       showToast("No valid item rows", "error");
@@ -3752,6 +3931,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
               </div>
               <Stamp label="Pending review" color={C.amber} bg={C.amberSoft} />
             </div>
+            <SourcePicker value={draft.source} onChange={(v) => setDraft({ ...draft, source: v })} accent={C.outboundOrder} />
             <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
               <Field label="Platform / Customer" style={{ flex: 1, minWidth: 160 }}>
                 <input value={draft.platform} onChange={(e) => setDraft({ ...draft, platform: e.target.value })} style={inputStyle} />
@@ -3759,19 +3939,13 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
               <Field label="Ship date" style={{ width: 160 }}>
                 <input type="date" value={draft.shipDate} onChange={(e) => setDraft({ ...draft, shipDate: e.target.value })} style={inputStyle} />
               </Field>
-              <Field label="Outbound source" style={{ width: 160 }}>
-                <select value={draft.source} onChange={(e) => setDraft({ ...draft, source: e.target.value })} style={inputStyle}>
-                  <option value="qtyNew">New Stock (A)</option>
-                  <option value="qtyReturn">Return Stock (B)</option>
-                </select>
-              </Field>
             </div>
             <ItemsEditor items={draft.items} setItems={(items) => setDraft({ ...draft, items })} showPrice={false} inventory={inventory} />
             <div style={{ display: "flex", justifyContent: "flex-end", gap: 10, marginTop: 14 }}>
               <Btn variant="outline" color={C.inkSoft} onClick={() => setDraft(null)}>
                 Cancel
               </Btn>
-              <Btn color={C.outboundOrder} icon={CheckCircle2} onClick={confirmOutbound}>
+              <Btn color={C.outboundOrder} icon={CheckCircle2} onClick={confirmOutbound} disabled={!draft.source}>
                 Confirm Outbound
               </Btn>
             </div>
