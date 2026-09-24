@@ -189,6 +189,16 @@ function normalizeSku(s) {
     .replace(/[\s\-_./]/g, "");
 }
 
+// A SKU ending in "-USED" (any casing, optional surrounding whitespace) is a
+// permanently-used-condition variant that always lives in Return Stock,
+// regardless of which upload flow or field it was entered through.
+function isUsedSku(sku) {
+  return /-USED\s*$/i.test(String(sku || "").trim());
+}
+function skuField(sku) {
+  return isUsedSku(sku) ? "qtyReturn" : "qtyNew";
+}
+
 function isSpreadsheetFile(file) {
   const name = (file.name || "").toLowerCase();
   return (
@@ -2296,6 +2306,13 @@ function SourcePicker({ value, onChange, accent }) {
   );
 }
 
+function summarizeSource(items) {
+  const hasUsed = items.some((it) => isUsedSku(it.sku));
+  const hasNew = items.some((it) => !isUsedSku(it.sku));
+  if (hasUsed && hasNew) return "Mixed (New + Return)";
+  return hasUsed ? "Return Stock" : "New Stock";
+}
+
 function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
   const update = (i, field, val) => {
     const next = [...items];
@@ -2502,6 +2519,12 @@ function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
                   style={{ ...inputStyle, padding: "3px 7px", width: 50 }}
                 />
               </div>
+            </div>
+          )}
+
+          {!it.needsMapping && it.sku.trim() && (
+            <div style={{ padding: "0 12px 7px", fontSize: 11, fontFamily: FONT_UI, color: isUsedSku(it.sku) ? C.amber : C.inkSoft }}>
+              → {isUsedSku(it.sku) ? "Return Stock (used-condition SKU)" : "New Stock"}
             </div>
           )}
         </div>
@@ -2938,7 +2961,6 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
   const isNew = type === "new";
   const accent = isNew ? C.inboundNew : C.inboundReturn;
   const accentSoft = isNew ? C.inboundNewSoft : C.inboundReturnSoft;
-  const targetField = isNew ? "qtyNew" : "qtyReturn";
   const partyLabel = isNew ? "Supplier" : "Source / returned by";
   const dateLabel = isNew ? "Invoice date" : "Return date";
   const title = isNew ? "New Stock Purchase" : "Return Stock Inbound";
@@ -2955,7 +2977,7 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
 
   const performDelete = (record) => {
     applyInventoryOps(
-      record.items.map((it) => ({ sku: it.sku, name: it.name, field: targetField, mode: "delta", value: -(Number(it.qty) || 0) }))
+      record.items.map((it) => ({ sku: it.sku, name: it.name, field: skuField(it.sku), mode: "delta", value: -(Number(it.qty) || 0) }))
     );
     removeInboundRecord(record.id);
     logAudit(
@@ -3079,7 +3101,7 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
       cleanItems.map((it) => ({
         sku: it.sku.trim(),
         name: it.name,
-        field: targetField,
+        field: skuField(it.sku),
         mode: "delta",
         value: Number(it.qty) || 0,
       }))
@@ -3315,8 +3337,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
   const typeRecords = outboundRecords.filter((r) => (r.type || "order") === "fba");
 
   const performDelete = (record) => {
-    const field = record.source === "New Stock" ? "qtyNew" : "qtyReturn";
-    applyInventoryOps(record.items.map((it) => ({ sku: it.sku, name: it.name, field, mode: "delta", value: Number(it.qty) || 0 })));
+    applyInventoryOps(record.items.map((it) => ({ sku: it.sku, name: it.name, field: skuField(it.sku), mode: "delta", value: Number(it.qty) || 0 })));
     removeOutboundRecord(record.id);
     logAudit("outbound-fba-delete", `Deleted FBA shipment ${record.shipmentId} — reversed ${record.items.length} item rows`);
     setDeleteTarget(null);
@@ -3429,21 +3450,18 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
   };
 
   const confirmOutbound = async () => {
-    if (!draft.source) {
-      showToast("Please choose New Stock or Return Stock first", "error");
-      return;
-    }
     const cleanItems = draft.items.filter((it) => it.sku.trim() && Number(it.qty) > 0);
     if (cleanItems.length === 0) {
       showToast("No valid item rows", "error");
       return;
     }
-    const field = draft.source;
-    const affectedSkus = new Set(cleanItems.map((it) => it.sku.trim()));
+    const affectedFields = new Map(cleanItems.map((it) => [it.sku.trim(), skuField(it.sku)]));
     const freshInventory = await applyInventoryOps(
-      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field, mode: "delta", value: -(Number(it.qty) || 0) }))
+      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field: skuField(it.sku), mode: "delta", value: -(Number(it.qty) || 0) }))
     );
-    const shortage = (freshInventory || []).some((x) => affectedSkus.has(x.sku) && Number(x[field]) < 0);
+    const shortage = (freshInventory || []).some(
+      (x) => affectedFields.has(x.sku) && Number(x[affectedFields.get(x.sku)]) < 0
+    );
 
     const mapGroups = new Map();
     cleanItems.forEach((it) => {
@@ -3471,7 +3489,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
       boxes: Number(draft.boxes) || 0,
       fileName: draft.fileName,
       fileHash: draft.fileHash || null,
-      source: field === "qtyNew" ? "New Stock" : "Return Stock",
+      source: summarizeSource(cleanItems),
       items: cleanItems,
       type: "fba",
     };
@@ -3504,7 +3522,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
               </div>
               <Stamp label="Pending review" color={C.amber} bg={C.amberSoft} />
             </div>
-            <SourcePicker value={draft.source} onChange={(v) => setDraft({ ...draft, source: v })} accent={C.outbound} />
+
             <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
               <Field label="Shipment ID" style={{ flex: 1, minWidth: 160 }}>
                 <input value={draft.shipmentId} onChange={(e) => setDraft({ ...draft, shipmentId: e.target.value })} style={{ ...inputStyle, fontFamily: FONT_MONO }} />
@@ -3521,7 +3539,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
               <Btn variant="outline" color={C.inkSoft} onClick={() => setDraft(null)}>
                 Cancel
               </Btn>
-              <Btn color={C.outbound} icon={CheckCircle2} onClick={confirmOutbound} disabled={!draft.source}>
+              <Btn color={C.outbound} icon={CheckCircle2} onClick={confirmOutbound}>
                 Confirm Shipment
               </Btn>
             </div>
@@ -3735,8 +3753,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
   const typeRecords = outboundRecords.filter((r) => (r.type || "order") === "order");
 
   const performDelete = (record) => {
-    const field = record.source === "New Stock" ? "qtyNew" : "qtyReturn";
-    applyInventoryOps(record.items.map((it) => ({ sku: it.sku, name: it.name, field, mode: "delta", value: Number(it.qty) || 0 })));
+    applyInventoryOps(record.items.map((it) => ({ sku: it.sku, name: it.name, field: skuField(it.sku), mode: "delta", value: Number(it.qty) || 0 })));
     removeOutboundRecord(record.id);
     logAudit("outbound-order-delete", `Deleted order fulfillment record from "${record.fileName}" (${record.platform}) — reversed ${record.items.length} item rows`);
     setDeleteTarget(null);
@@ -3859,21 +3876,18 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
   };
 
   const confirmOutbound = async () => {
-    if (!draft.source) {
-      showToast("Please choose New Stock or Return Stock first", "error");
-      return;
-    }
     const cleanItems = draft.items.filter((it) => it.sku.trim() && Number(it.qty) > 0);
     if (cleanItems.length === 0) {
       showToast("No valid item rows", "error");
       return;
     }
-    const field = draft.source;
-    const affectedSkus = new Set(cleanItems.map((it) => it.sku.trim()));
+    const affectedFields = new Map(cleanItems.map((it) => [it.sku.trim(), skuField(it.sku)]));
     const freshInventory = await applyInventoryOps(
-      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field, mode: "delta", value: -(Number(it.qty) || 0) }))
+      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field: skuField(it.sku), mode: "delta", value: -(Number(it.qty) || 0) }))
     );
-    const shortage = (freshInventory || []).some((x) => affectedSkus.has(x.sku) && Number(x[field]) < 0);
+    const shortage = (freshInventory || []).some(
+      (x) => affectedFields.has(x.sku) && Number(x[affectedFields.get(x.sku)]) < 0
+    );
 
     const mapGroups = new Map();
     cleanItems.forEach((it) => {
@@ -3898,7 +3912,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
       platform: draft.platform || "Unspecified",
       fileName: draft.fileName,
       fileHash: draft.fileHash || null,
-      source: field === "qtyNew" ? "New Stock" : "Return Stock",
+      source: summarizeSource(cleanItems),
       items: cleanItems,
       type: "order",
     };
@@ -3931,7 +3945,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
               </div>
               <Stamp label="Pending review" color={C.amber} bg={C.amberSoft} />
             </div>
-            <SourcePicker value={draft.source} onChange={(v) => setDraft({ ...draft, source: v })} accent={C.outboundOrder} />
+
             <div style={{ display: "flex", gap: 10, marginBottom: 12, flexWrap: "wrap" }}>
               <Field label="Platform / Customer" style={{ flex: 1, minWidth: 160 }}>
                 <input value={draft.platform} onChange={(e) => setDraft({ ...draft, platform: e.target.value })} style={inputStyle} />
@@ -3945,7 +3959,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
               <Btn variant="outline" color={C.inkSoft} onClick={() => setDraft(null)}>
                 Cancel
               </Btn>
-              <Btn color={C.outboundOrder} icon={CheckCircle2} onClick={confirmOutbound} disabled={!draft.source}>
+              <Btn color={C.outboundOrder} icon={CheckCircle2} onClick={confirmOutbound}>
                 Confirm Outbound
               </Btn>
             </div>
