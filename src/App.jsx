@@ -973,7 +973,12 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
   };
 
   const Section = ({ label, color, field }) => {
-    const baseList = query.trim() ? filtered : filtered.filter((x) => (x[field] || 0) !== 0);
+    // A "-USED" SKU always belongs in Return Stock — its New Stock number can
+    // only ever be 0, so it's excluded from the New Stock section outright,
+    // even while actively searching (0-qty search visibility is for genuine
+    // "does this SKU exist here" checks, not for a bucket it can never be in).
+    const relevant = field === "qtyNew" ? filtered.filter((x) => !isUsedSku(x.sku)) : filtered;
+    const baseList = query.trim() ? relevant : relevant.filter((x) => (x[field] || 0) !== 0);
     const visible = sortItems(baseList, field);
     return (
     <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 5, overflow: "hidden" }}>
