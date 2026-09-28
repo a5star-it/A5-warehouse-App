@@ -1,4 +1,8 @@
-import React, { useState, useEffect, useCallback, useRef } from "react";
+import React, { useState, useEffect, useCallback, useRef, createContext, useContext } from "react";
+
+// Lets the review-screen row editor remove a wrong learned rule without threading
+// deleteAlias through every flow that renders it.
+const AliasActionsContext = createContext(null);
 import * as XLSX from "xlsx";
 
 /* ---------------------------------------------------------------
@@ -426,7 +430,7 @@ function resolveSkus(items, inventory, aliasMap, ignoredSkus = []) {
   const result = [];
   items
     .filter((it) => !ignoredSet.has(normalizeSku(it.sku)))
-    .forEach((it) => {
+    .forEach((it, srcIdx) => {
       const raw = it.sku;
       const rawQty = it.qty;
       const norm = normalizeSku(raw);
@@ -449,6 +453,7 @@ function resolveSkus(items, inventory, aliasMap, ignoredSkus = []) {
             mappedFrom: raw,
             needsMapping: false,
             autoMapped: true,
+            _src: srcIdx,
           });
         });
         return;
@@ -1230,10 +1235,37 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
 }
 
 function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory, isAdmin, onClose }) {
-  const entries = Object.entries(aliasMap || {});
+  const allEntries = Object.entries(aliasMap || {});
   const [showAdd, setShowAdd] = useState(false);
   const [rawInput, setRawInput] = useState("");
   const [components, setComponents] = useState([{ sku: "", qty: 1 }]);
+  const [editingKey, setEditingKey] = useState(null);
+  const [ruleSearch, setRuleSearch] = useState("");
+  const q = normalizeSku(ruleSearch);
+  const entries = q
+    ? allEntries.filter(
+        ([k, v]) => k.includes(q) || aliasComponents(v).some((c) => normalizeSku(c.sku).includes(q))
+      )
+    : allEntries;
+
+  const startEdit = (key, v) => {
+    setEditingKey(key);
+    setRawInput(v.raw);
+    setComponents(aliasComponents(v).map((c) => ({ sku: c.sku, qty: c.qty })));
+    setShowAdd(true);
+  };
+  const startAdd = () => {
+    setEditingKey(null);
+    setRawInput("");
+    setComponents([{ sku: "", qty: 1 }]);
+    setShowAdd(true);
+  };
+  const cancelForm = () => {
+    setEditingKey(null);
+    setRawInput("");
+    setComponents([{ sku: "", qty: 1 }]);
+    setShowAdd(false);
+  };
 
   const remove = (key) => {
     const raw = aliasMap[key]?.raw || key;
@@ -1242,7 +1274,7 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
   };
   const exportCSV = () => {
     const rows = [["Raw SKU", "Maps to SKU", "Qty"]];
-    entries.forEach(([, v]) => {
+    allEntries.forEach(([, v]) => {
       aliasComponents(v).forEach((c) => rows.push([v.raw, c.sku, c.qty]));
     });
     downloadCSV(rows, `sku-mapping-rules-${todayISO()}.csv`);
@@ -1252,16 +1284,23 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
   const addComponent = () => setComponents([...components, { sku: "", qty: 1 }]);
   const removeComponent = (ci) => setComponents(components.filter((_, i) => i !== ci));
 
-  const saveRule = () => {
+  const saveRule = async () => {
     const raw = rawInput.trim();
     if (!raw) return;
     const comps = components.map((c) => ({ sku: String(c.sku || "").trim(), qty: Number(c.qty) || 1 })).filter((c) => c.sku);
     if (comps.length === 0) return;
-    setAlias(normalizeSku(raw), { raw, components: comps });
-    logAudit("alias-add", `Added SKU mapping rule: "${raw}" → ${comps.map((c) => `${c.sku} ×${c.qty}`).join(", ")}`);
-    setRawInput("");
-    setComponents([{ sku: "", qty: 1 }]);
-    setShowAdd(false);
+    const newKey = normalizeSku(raw);
+    const desc = comps.map((c) => `${c.sku} ×${c.qty}`).join(", ");
+    if (editingKey) {
+      // Renaming the raw SKU changes the lookup key — remove the old one first.
+      if (editingKey !== newKey) await deleteAlias(editingKey);
+      await setAlias(newKey, { raw, components: comps });
+      logAudit("alias-edit", `Edited SKU mapping rule: "${raw}" → ${desc}`);
+    } else {
+      await setAlias(newKey, { raw, components: comps });
+      logAudit("alias-add", `Added SKU mapping rule: "${raw}" → ${desc}`);
+    }
+    cancelForm();
   };
 
   return (
@@ -1279,9 +1318,17 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
         "a 4-pack of it" — the rule is what disambiguates). A rule can map to one product at a quantity, or several
         different products at once for a bundle.
       </div>
+      {allEntries.length > 6 && (
+        <input
+          value={ruleSearch}
+          onChange={(e) => setRuleSearch(e.target.value)}
+          placeholder="Search rules by raw SKU or target SKU…"
+          style={{ ...inputStyle, marginBottom: 10 }}
+        />
+      )}
       {entries.length === 0 ? (
         <div style={{ fontSize: 13, color: C.inkSoft, fontFamily: FONT_UI, padding: "8px 0" }}>
-          No mapping rules yet. Rules are saved automatically when you resolve an unrecognized SKU during inbound or
+          {allEntries.length > 0 ? "No rules match that search." : "No mapping rules yet."} Rules are saved automatically when you resolve an unrecognized SKU during inbound or
           outbound — or add one manually below for cases the system can't flag on its own (like a raw SKU that's
           identical to an existing one).
         </div>
@@ -1290,7 +1337,7 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
           <div
             style={{
               display: "grid",
-              gridTemplateColumns: "1.1fr 24px 1.6fr 26px",
+              gridTemplateColumns: "1.1fr 24px 1.6fr 52px",
               padding: "8px 12px",
               background: C.surfaceSoft,
               fontSize: 11.5,
@@ -1309,7 +1356,7 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
               key={key}
               style={{
                 display: "grid",
-                gridTemplateColumns: "1.1fr 24px 1.6fr 26px",
+                gridTemplateColumns: "1.1fr 24px 1.6fr 52px",
                 padding: "7px 12px",
                 borderTop: `1px solid ${C.surfaceSoft}`,
                 fontSize: 12.5,
@@ -1320,9 +1367,14 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
               <div>{v.raw}</div>
               <div style={{ color: C.inkSoft }}>→</div>
               <div>{aliasComponents(v).map((c) => `${c.sku} ×${c.qty}`).join(", ")}</div>
-              <button onClick={() => remove(key)} style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft }}>
-                <Trash2 size={13} />
-              </button>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button onClick={() => startEdit(key, v)} title="Edit rule" style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft, display: "flex" }}>
+                  <Pencil size={13} />
+                </button>
+                <button onClick={() => remove(key)} title="Delete rule" style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft, display: "flex" }}>
+                  <Trash2 size={13} />
+                </button>
+              </div>
             </div>
           ))}
         </div>
@@ -1330,6 +1382,9 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
 
       {showAdd ? (
         <div style={{ border: `1px solid ${C.border}`, borderRadius: 5, padding: 12, marginBottom: 14, background: C.surfaceSoft }}>
+          {editingKey && (
+            <div style={{ fontSize: 12, fontWeight: 700, color: C.inventory, fontFamily: FONT_UI, marginBottom: 8 }}>Editing existing rule</div>
+          )}
           <Field label="Raw SKU as it appears on the document">
             <input value={rawInput} onChange={(e) => setRawInput(e.target.value)} style={{ ...inputStyle, fontFamily: FONT_MONO }} placeholder="e.g. SH-MINI1G3" />
           </Field>
@@ -1363,24 +1418,24 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
               Add component
             </Btn>
             <div style={{ display: "flex", gap: 8 }}>
-              <Btn variant="outline" color={C.inkSoft} onClick={() => setShowAdd(false)}>
+              <Btn variant="outline" color={C.inkSoft} onClick={cancelForm}>
                 Cancel
               </Btn>
               <Btn color={C.inventory} onClick={saveRule}>
-                Save rule
+                {editingKey ? "Save changes" : "Save rule"}
               </Btn>
             </div>
           </div>
         </div>
       ) : (
-        <Btn variant="outline" color={C.inventory} icon={Plus} onClick={() => setShowAdd(true)} style={{ marginBottom: 14 }}>
+        <Btn variant="outline" color={C.inventory} icon={Plus} onClick={startAdd} style={{ marginBottom: 14 }}>
           Add rule manually
         </Btn>
       )}
 
       <div style={{ display: "flex", justifyContent: "flex-end" }}>
         {isAdmin && (
-          <Btn color={C.inventory} icon={Download} onClick={exportCSV} disabled={entries.length === 0}>
+          <Btn color={C.inventory} icon={Download} onClick={exportCSV} disabled={allEntries.length === 0}>
             Export CSV
           </Btn>
         )}
@@ -2319,6 +2374,39 @@ function summarizeSource(items) {
 }
 
 function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
+  const aliasActions = useContext(AliasActionsContext);
+
+  // A learned rule matched this row but the match is wrong: drop the rule and
+  // turn the row(s) it produced back into the original unrecognized line, so it
+  // can be re-mapped right here (the corrected mapping is saved on confirm).
+  const revertRule = async (i) => {
+    const it = items[i];
+    const grp = it._src != null ? items.map((r, idx) => (r.autoMapped && r._src === it._src ? idx : -1)).filter((x) => x >= 0) : [i];
+    const first = Math.min(...grp);
+    const rawRow = {
+      ...it,
+      sku: it.rawSku || it.mappedFrom || it.sku,
+      qty: it.rawQty != null ? it.rawQty : it.qty,
+      qtyMultiplier: 1,
+      needsMapping: true,
+      autoMapped: false,
+      mappedFrom: undefined,
+      components: undefined,
+      _src: undefined,
+    };
+    const next = [];
+    items.forEach((r, idx) => {
+      if (grp.includes(idx)) {
+        if (idx === first) next.push(rawRow);
+      } else next.push(r);
+    });
+    setItems(next);
+    if (aliasActions && aliasActions.deleteAlias && it.mappedFrom) {
+      await aliasActions.deleteAlias(normalizeSku(it.mappedFrom));
+      logAudit("alias-delete", `Removed SKU mapping rule for "${it.mappedFrom}" (flagged as wrong during review)`);
+    }
+  };
+
   const update = (i, field, val) => {
     const next = [...items];
     const cur = { ...next[i], [field]: val };
@@ -2515,6 +2603,14 @@ function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
                   {it.autoMapped ? "Auto-matched via learned rule: " : "Mapped from: "}
                   {it.rawSku} → {it.sku}
                 </span>
+                {it.autoMapped && (
+                  <button
+                    onClick={() => revertRule(i)}
+                    style={{ border: `1px solid ${C.danger}`, background: "none", color: C.danger, borderRadius: 4, padding: "2px 8px", fontSize: 11, cursor: "pointer", fontFamily: FONT_UI, whiteSpace: "nowrap" }}
+                  >
+                    Wrong match? Re-map
+                  </button>
+                )}
                 <span style={{ marginLeft: "auto", whiteSpace: "nowrap" }}>units per row ×</span>
                 <input
                   type="number"
@@ -4463,6 +4559,7 @@ export default function WarehouseApp() {
   const isAdmin = auth.role === "admin";
 
   return (
+    <AliasActionsContext.Provider value={{ deleteAlias }}>
     <div style={{ fontFamily: FONT_UI, background: C.bg, minHeight: "100%", color: C.ink }}>
       {globalStyle}
 
@@ -4573,5 +4670,6 @@ export default function WarehouseApp() {
 
       <Toast toast={toast} />
     </div>
+    </AliasActionsContext.Provider>
   );
 }
