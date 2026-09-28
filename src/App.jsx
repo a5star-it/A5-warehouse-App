@@ -337,18 +337,79 @@ function dateFromFilename(fileName) {
 function parsePlatformDateFilename(fileName) {
   const base = String(fileName || "").replace(/\.[^.]+$/, "").trim();
   // "{Platform} {YYYY-MM-DD}" (year first)
-  let m = base.match(/^(.+?)\s+(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
+  let m = base.match(/^(.+?)[\s_]+(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
   if (m) {
     const y = m[2], mo = m[3].padStart(2, "0"), d = m[4].padStart(2, "0");
     return { platform: m[1].trim(), date: `${y}-${mo}-${d}` };
   }
   // "{Platform} {DD_MM_YYYY}" (day-month-year, European convention — year last)
-  m = base.match(/^(.+?)\s+(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})$/);
+  m = base.match(/^(.+?)[\s_]+(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})$/);
   if (m) {
     const d = m[2].padStart(2, "0"), mo = m[3].padStart(2, "0"), y = m[4];
     return { platform: m[1].trim(), date: `${y}-${mo}-${d}` };
   }
   return null;
+}
+
+// --- eBay daily shipping report (Excel export) ----------------------------
+// Italian money text such as "82,00 €" or "1.234,56 €" -> 82 / 1234.56
+function parseEuroNumber(v) {
+  if (typeof v === "number") return v;
+  let t = String(v ?? "").replace(/[^\d,.\-]/g, "");
+  if (!t) return 0;
+  if (t.includes(",")) t = t.replace(/\./g, "").replace(",", ".");
+  const n = parseFloat(t);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// The eBay export has junk header cells above the real header row, a blank
+// row, then one row per sold line, then a footer ("N record scaricati").
+// Columns are found by their header text (Numero ordine / Etichetta
+// personalizzata / Quantità / Prezzo finale = columns B / Y / AA / AB); if the
+// headers aren't recognised but the file is named "ebay…", fall back to those
+// fixed column positions. Every row keeps its own order number so a later SKU
+// search can show exactly which order shipped what.
+function parseEbayReport(grid, fileName) {
+  const norm = (v) => String(v ?? "").trim().toLowerCase();
+  const h = grid.findIndex((row) => (row || []).some((c) => norm(c) === "numero ordine"));
+  let cols = null;
+  let start = 0;
+  if (h >= 0) {
+    const find = (...names) => (grid[h] || []).findIndex((c) => names.includes(norm(c)));
+    cols = {
+      order: find("numero ordine"),
+      sku: find("etichetta personalizzata"),
+      qty: find("quantità", "quantita"),
+      price: find("prezzo finale"),
+      title: find("titolo"),
+    };
+    if (cols.order < 0 || cols.sku < 0 || cols.qty < 0) cols = null;
+    else start = h + 1;
+  }
+  if (!cols) {
+    const width = Math.max(0, ...grid.map((r) => (r || []).length));
+    if (!/^ebay/i.test(String(fileName || "").trim()) || width < 28) return [];
+    cols = { order: 1, sku: 24, qty: 26, price: 27, title: 23 };
+    start = 0;
+  }
+  const items = [];
+  let lastOrder = "";
+  for (let r = start; r < grid.length; r++) {
+    const row = grid[r] || [];
+    const orderCell = String(row[cols.order] ?? "").trim();
+    if (orderCell) lastOrder = orderCell;
+    const sku = String(row[cols.sku] ?? "").trim();
+    const qty = Number(String(row[cols.qty] ?? "").replace(",", "."));
+    if (!sku || !(qty > 0)) continue; // blank rows, footer lines, stray headers
+    items.push({
+      sku,
+      name: cols.title >= 0 ? String(row[cols.title] ?? "").trim() : "",
+      qty,
+      unitPrice: cols.price >= 0 ? parseEuroNumber(row[cols.price]) : 0,
+      orderId: orderCell || lastOrder,
+    });
+  }
+  return items;
 }
 
 // --- Amazon Seller Central packing-slip HTML (saved page) ---------------
@@ -3902,6 +3963,21 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
     if (isSpreadsheetFile(file)) {
       try {
         const { grid, rows, headers } = await parseSpreadsheetFile(file);
+        const ebayItems = parseEbayReport(grid, file.name);
+        if (ebayItems.length > 0) {
+          const fnMeta = parsePlatformDateFilename(file.name);
+          setDraft({
+            platform: fnMeta?.platform || "eBay",
+            shipDate: fnMeta?.date || todayISO(),
+            source: null,
+            items: resolveSkus(ebayItems, inventory, aliasMap, ignoredSkus),
+            fileName: file.name,
+            fileHash: hash,
+          });
+          const orders = new Set(ebayItems.map((it) => it.orderId)).size;
+          showToast(`Detected ${ebayItems.length} lines from ${orders} eBay orders`);
+          return;
+        }
         const sections = findSkuSections(grid);
         const sectionItems = itemsFromSkuSections(sections);
         if (sectionItems.length > 0) {
