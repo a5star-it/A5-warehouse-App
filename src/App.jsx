@@ -611,6 +611,30 @@ function resolveSkus(items, inventory, aliasMap, ignoredSkus = []) {
   return result;
 }
 
+// New Stock Purchase never maps a SKU to something else — whatever code is on
+// the invoice IS the SKU. The only thing flagged is a SKU that doesn't exist
+// in inventory yet, so the person can consciously confirm it's really new
+// (catches typos) before it silently creates a product line.
+function resolveSkusStrict(items, inventory, ignoredSkus = []) {
+  const ignoredSet = new Set((ignoredSkus || []).map(normalizeSku));
+  const invSkus = new Set(inventory.map((x) => normalizeSku(x.sku)));
+  return items
+    .filter((it) => !ignoredSet.has(normalizeSku(it.sku)))
+    .map((it) => {
+      const raw = String(it.sku || "").trim();
+      const known = invSkus.has(normalizeSku(raw));
+      return {
+        ...it,
+        sku: raw,
+        rawQty: it.qty,
+        qtyMultiplier: 1,
+        needsMapping: false,
+        isNewSku: !known && !!raw,
+        newSkuConfirmed: false,
+      };
+    });
+}
+
 async function extractFromFile(file, mode) {
   const base64 = await fileToBase64(file);
   const isPdf = file.type === "application/pdf";
@@ -2763,6 +2787,20 @@ function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
             </div>
           )}
 
+          {it.isNewSku && !it.newSkuConfirmed && (
+            <div style={{ padding: "6px 12px 10px", background: C.amberSoft, fontSize: 12, fontFamily: FONT_UI }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                <AlertTriangle size={13} color={C.amber} style={{ flexShrink: 0 }} />
+                <span style={{ color: C.inkSoft }}>
+                  "{it.sku}" isn't in inventory yet — this will create it as a new SKU, exactly as written.
+                </span>
+                <Btn color={C.amber} onClick={() => update(i, "newSkuConfirmed", true)} style={{ fontSize: 12, padding: "4px 10px", marginLeft: "auto" }}>
+                  Confirm & add as new SKU
+                </Btn>
+              </div>
+            </div>
+          )}
+
           {!it.needsMapping && it.mappedFrom && (
             <div style={{ padding: "5px 12px 9px", background: C.surfaceSoft, fontSize: 11.5, fontFamily: FONT_UI }}>
               <div style={{ display: "flex", alignItems: "center", gap: 6, color: it.autoMapped ? C.inboundNew : C.inkSoft }}>
@@ -3228,6 +3266,10 @@ function InboundHub({ setView, inboundRecords }) {
 --------------------------------------------------------------- */
 function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboundRecords, saveInboundRecords, addInboundRecord, removeInboundRecord, outboundRecords, aliasMap, saveAliasMap, setAlias, ignoredSkus, showToast, setView, isAdmin }) {
   const isNew = type === "new";
+  // New Stock Purchase: the invoice's SKU is final, never mapped to
+  // something else — only flag a SKU inventory doesn't know yet. Return
+  // Stock Inbound keeps the full alias/bundle mapping behaviour.
+  const resolve = (items) => (isNew ? resolveSkusStrict(items, inventory, ignoredSkus) : resolveSkus(items, inventory, aliasMap, ignoredSkus));
   const accent = isNew ? C.inboundNew : C.inboundReturn;
   const accentSoft = isNew ? C.inboundNewSoft : C.inboundReturnSoft;
   const partyLabel = isNew ? "Supplier" : "Source / returned by";
@@ -3279,7 +3321,7 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
         const sections = findSkuSections(grid);
         const sectionItems = itemsFromSkuSections(sections);
         if (sectionItems.length > 0) {
-          const resolved = resolveSkus(sectionItems, inventory, aliasMap, ignoredSkus);
+          const resolved = resolve(sectionItems);
           setDraft({
             supplier: "",
             invoiceDate: todayISO(),
@@ -3314,7 +3356,7 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
       setDraft({
         supplier: extracted.supplier || "",
         invoiceDate: extracted.invoice_date || todayISO(),
-        items: resolveSkus(rawItems, inventory, aliasMap, ignoredSkus),
+        items: resolve(rawItems),
         totalAmount: Number(extracted.total_amount) || 0,
         fileName: file.name,
         fileHash: hash,
@@ -3346,7 +3388,7 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
         unitPrice: priceCol ? Number(r[priceCol]) || 0 : 0,
       }))
       .filter((it) => it.sku && it.qty > 0);
-    const resolved = resolveSkus(rawItems, inventory, aliasMap, ignoredSkus);
+    const resolved = resolve(rawItems);
     setDraft({
       supplier: "",
       invoiceDate: todayISO(),
@@ -3463,7 +3505,12 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
               <Btn variant="outline" color={C.inkSoft} onClick={() => setDraft(null)}>
                 Cancel
               </Btn>
-              <Btn color={accent} icon={CheckCircle2} onClick={confirmInbound}>
+              <Btn
+                color={accent}
+                icon={CheckCircle2}
+                onClick={confirmInbound}
+                disabled={draft.items.some((it) => it.isNewSku && !it.newSkuConfirmed)}
+              >
                 {isNew ? "Confirm Purchase" : "Confirm Return"}
               </Btn>
             </div>
