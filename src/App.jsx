@@ -1,4 +1,7 @@
 import React, { useState, useEffect, useCallback, useRef, createContext, useContext } from "react";
+import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.mjs";
+import pdfjsWorkerUrl from "pdfjs-dist/legacy/build/pdf.worker.mjs?url";
+pdfjsLib.GlobalWorkerOptions.workerSrc = pdfjsWorkerUrl;
 
 // Lets the review-screen row editor remove a wrong learned rule without threading
 // deleteAlias through every flow that renders it.
@@ -317,14 +320,16 @@ function orderIdFromFilename(fileName) {
 // date, e.g. "2026-09-10.html".
 function dateFromFilename(fileName) {
   const base = String(fileName || "").replace(/\.[^.]+$/, "").trim();
-  // YYYY-MM-DD (year first)
-  let m = base.match(/^(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})$/);
+  // YYYY-MM-DD (year first) — matched anywhere in the name, so
+  // "2026-09-29.html" and "2026-09-29_Amazon.pdf" both work.
+  let m = base.match(/(\d{4})[-_.](\d{1,2})[-_.](\d{1,2})/);
   if (m) {
     const y = m[1], mo = m[2].padStart(2, "0"), d = m[3].padStart(2, "0");
     return `${y}-${mo}-${d}`;
   }
-  // DD_MM_YYYY (day-month-year, European convention — year last)
-  m = base.match(/^(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})$/);
+  // DD_MM_YYYY (day-month-year, European convention — year last), also
+  // matched anywhere in the name.
+  m = base.match(/(\d{1,2})[-_.](\d{1,2})[-_.](\d{4})/);
   if (m) {
     const d = m[1].padStart(2, "0"), mo = m[2].padStart(2, "0"), y = m[3];
     return `${y}-${mo}-${d}`;
@@ -456,6 +461,84 @@ async function parseAmazonPackingSlip(file) {
   // Deliberately NOT aggregated by SKU — keeping one row per order line lets
   // a later SKU search show exactly which order shipped how much, even when
   // several orders in the same file ship the same product.
+  return rows;
+}
+
+// --- Amazon self-ship packing slip, downloaded as PDF -------------------
+// Same multi-order document as the HTML version above, but Amazon's PDF
+// export flattens everything to plain text with no structure to walk, so
+// this is parsed with regex over the extracted text instead of the DOM.
+function isAmazonSelfShipPdfName(file) {
+  return /\.pdf$/i.test(file.name || "") || file.type === "application/pdf";
+}
+
+async function extractPdfText(file) {
+  const buf = await file.arrayBuffer();
+  const pdf = await pdfjsLib.getDocument({ data: buf }).promise;
+  let text = "";
+  for (let i = 1; i <= pdf.numPages; i++) {
+    const page = await pdf.getPage(i);
+    const content = await page.getTextContent();
+    // pdf.js gives one item per run of text with its own position; joining
+    // with newlines between items keeps line-based patterns (SKU:, ASIN: …)
+    // matchable even though the original layout used explicit line breaks.
+    text += content.items.map((it) => it.str).join("\n") + "\n";
+  }
+  return text;
+}
+
+function parseAmazonSelfShipPdfText(text) {
+  const orderIdPattern = /\d{3}-\d{7}-\d{7}/;
+  // Split into one chunk per order. pdf.js gives one continuous text stream,
+  // so each chunk still trails into the next order's shipping-address lines
+  // (which can themselves contain plain numbers like a postal code) — the
+  // "Grazie per aver comprato" footer is used below to cut items off before
+  // that trailing address ever gets scanned.
+  const blocks = text.split(/(?=Numero dell.ordine:)/).filter((b) => orderIdPattern.test(b));
+  const rows = [];
+  blocks.forEach((block) => {
+    const orderId = block.match(orderIdPattern)[0];
+    const footerIdx = block.search(/Grazie per aver comprato/i);
+    const itemsText = footerIdx >= 0 ? block.slice(0, footerIdx) : block;
+    const lines = itemsText.split("\n").map((l) => l.trim());
+    let started = false;
+    let j = 0;
+    while (j < lines.length) {
+      if (!started) {
+        // Items only start after the "Quantità … Totale ordine" table
+        // header — everything before it (address, order date) is noise.
+        if (lines[j] === "Totale ordine") started = true;
+        j++;
+        continue;
+      }
+      // The quantity is the next standalone numeric line. The product title
+      // right after it often starts with a digit too (e.g. "2 Pezzi
+      // Batterie…"), but that's a separate line here, not part of this one.
+      while (j < lines.length && !/^\d+$/.test(lines[j] || "")) j++;
+      if (j >= lines.length) break;
+      const qty = Number(lines[j]);
+      j++;
+      while (j < lines.length && lines[j] !== "SKU:") j++;
+      if (j >= lines.length) break;
+      j++;
+      while (j < lines.length && !lines[j]) j++;
+      const sku = lines[j] || "";
+      j++;
+      while (j < lines.length && !/^N\.\s*prodotto:?$/i.test(lines[j] || "")) j++;
+      if (j >= lines.length) {
+        if (sku && qty > 0) rows.push({ sku, name: "", qty, unitPrice: 0, orderId });
+        break;
+      }
+      j++;
+      while (j < lines.length && !lines[j]) j++;
+      j++; // the product-number value itself, not needed
+      while (j < lines.length && !lines[j]) j++;
+      const priceMatch = (lines[j] || "").match(/([\d.,]+)\s*€/);
+      const unitPrice = priceMatch ? parseFloat(priceMatch[1].replace(/\./g, "").replace(",", ".")) : 0;
+      if (sku && qty > 0) rows.push({ sku, name: "", qty, unitPrice, orderId });
+      j++;
+    }
+  });
   return rows;
 }
 
@@ -3962,6 +4045,30 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
   };
 
   const processFile = async (file, hash) => {
+    if (isAmazonSelfShipPdfName(file)) {
+      try {
+        const text = await extractPdfText(file);
+        const parsedItems = parseAmazonSelfShipPdfText(text);
+        if (parsedItems.length > 0) {
+          const resolved = resolveSkus(parsedItems, inventory, aliasMap, ignoredSkus);
+          setDraft({
+            platform: "Amazon",
+            shipDate: dateFromFilename(file.name) || todayISO(),
+            source: null,
+            items: resolved,
+            fileName: file.name,
+            fileHash: hash,
+          });
+          const orders = new Set(parsedItems.map((it) => it.orderId)).size;
+          showToast(`Detected ${parsedItems.length} lines from ${orders} Amazon orders`);
+          return;
+        }
+        // Not this format after all (e.g. a regular scanned invoice) — fall
+        // through to the generic AI-vision extraction below.
+      } catch (e) {
+        // Extraction failure also falls through rather than giving up.
+      }
+    }
     if (isAmazonPackingSlipFile(file)) {
       try {
         const parsedItems = await parseAmazonPackingSlip(file);
