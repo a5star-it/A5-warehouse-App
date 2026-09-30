@@ -1011,23 +1011,45 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
   };
 
   const submitForm = () => {
+    if (!isAdmin && editing === "new") {
+      showToast("Only admins can add new SKUs", "error");
+      return;
+    }
     if (!form.sku.trim() || !form.name.trim()) {
       showToast("SKU and product name are required", "error");
       return;
     }
+    // Non-admins can only rename the product or change its brand — the SKU
+    // code and both quantities stay exactly as loaded, no matter what a
+    // tampered client sends, since the ops sent below simply omit them.
+    const original = editing !== "new" ? inventory.find((x) => x.sku === editing) : null;
     const record = {
-      sku: form.sku.trim(),
+      sku: isAdmin ? form.sku.trim() : editing,
       name: form.name.trim(),
       brand: (form.brand || "").trim(),
-      qtyNew: Number(form.qtyNew) || 0,
-      qtyReturn: Number(form.qtyReturn) || 0,
+      qtyNew: isAdmin ? Number(form.qtyNew) || 0 : (original ? original.qtyNew || 0 : 0),
+      qtyReturn: isAdmin ? Number(form.qtyReturn) || 0 : (original ? original.qtyReturn || 0 : 0),
     };
-    applyInventoryOps([
-      { sku: record.sku, name: record.name, field: "qtyNew", mode: "set", value: record.qtyNew },
-      { sku: record.sku, name: record.name, field: "qtyReturn", mode: "set", value: record.qtyReturn },
+    // The server only fills in `name` as side-channel metadata when a SKU has
+    // none yet (so routine qty ops from other flows can't clobber a curated
+    // name) — an explicit "name" field op is what actually renames it here.
+    const ops = [
+      { sku: record.sku, field: "name", mode: "set", value: record.name },
       { sku: record.sku, name: record.name, field: "brand", mode: "set", value: record.brand },
-    ]);
-    logAudit("inventory-adjust", `Set ${record.sku} to New=${record.qtyNew}, Return=${record.qtyReturn}${record.brand ? `, Brand=${record.brand}` : ""}`);
+    ];
+    if (isAdmin) {
+      ops.push(
+        { sku: record.sku, name: record.name, field: "qtyNew", mode: "set", value: record.qtyNew },
+        { sku: record.sku, name: record.name, field: "qtyReturn", mode: "set", value: record.qtyReturn }
+      );
+    }
+    applyInventoryOps(ops);
+    logAudit(
+      "inventory-adjust",
+      isAdmin
+        ? `Set ${record.sku} to New=${record.qtyNew}, Return=${record.qtyReturn}${record.brand ? `, Brand=${record.brand}` : ""}`
+        : `Updated ${record.sku} product info (name/brand only)`
+    );
     setEditing(null);
     showToast("Inventory updated");
   };
@@ -1143,9 +1165,11 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
             <option value="qty-desc">Sort: Qty (High–Low)</option>
             <option value="qty-asc">Sort: Qty (Low–High)</option>
           </select>
-          <Btn onClick={openNew} color={C.inventory} icon={Plus}>
-            Add / Adjust
-          </Btn>
+          {isAdmin && (
+            <Btn onClick={openNew} color={C.inventory} icon={Plus}>
+              Add / Adjust
+            </Btn>
+          )}
           {isAdmin && (
             <Btn onClick={() => setShowBrandImport(true)} color={C.inventory} variant="outline" icon={Upload}>
               Import Brands
@@ -1194,11 +1218,11 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
       </div>
 
       {editing && (
-        <Modal onClose={() => setEditing(null)} title={editing === "new" ? "Add inventory item" : "Adjust inventory"} accent={C.inventory}>
+        <Modal onClose={() => setEditing(null)} title={editing === "new" ? "Add inventory item" : isAdmin ? "Adjust inventory" : "Edit product info"} accent={C.inventory}>
           <Field label="SKU">
             <input
               value={form.sku}
-              disabled={editing !== "new"}
+              disabled={editing !== "new" || !isAdmin}
               onChange={(e) => setForm({ ...form, sku: e.target.value })}
               style={inputStyle}
             />
@@ -1221,14 +1245,14 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
           </Field>
           <div style={{ display: "flex", gap: 10 }}>
             <Field label="New qty" style={{ flex: 1 }}>
-              <input type="number" value={form.qtyNew} onChange={(e) => setForm({ ...form, qtyNew: e.target.value })} style={inputStyle} />
+              <input type="number" value={form.qtyNew} disabled={!isAdmin} onChange={(e) => setForm({ ...form, qtyNew: e.target.value })} style={inputStyle} />
             </Field>
             <Field label="Return qty" style={{ flex: 1 }}>
-              <input type="number" value={form.qtyReturn} onChange={(e) => setForm({ ...form, qtyReturn: e.target.value })} style={inputStyle} />
+              <input type="number" value={form.qtyReturn} disabled={!isAdmin} onChange={(e) => setForm({ ...form, qtyReturn: e.target.value })} style={inputStyle} />
             </Field>
           </div>
           <div style={{ display: "flex", justifyContent: "space-between", marginTop: 16 }}>
-            {editing !== "new" ? (
+            {editing !== "new" && isAdmin ? (
               <Btn color={C.danger} variant="outline" icon={Trash2} onClick={() => { removeItem(editing); setEditing(null); }}>
                 Delete item
               </Btn>
