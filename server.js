@@ -233,6 +233,19 @@ app.post("/api/inventory/adjust", requireAuth, (req, res) => {
   const { operations } = req.body || {};
   if (!Array.isArray(operations)) return res.status(400).json({ error: "operations array required" });
 
+  // Deleting a SKU, or directly SETTING an absolute quantity (as opposed to a
+  // delta), is a deliberate override of the stock count — reserved for admins
+  // (manual Add/Adjust, Stock Count). Everyday inbound/outbound confirms only
+  // ever send "delta" ops on quantities, so this never blocks normal use;
+  // it's enforced here, not just hidden in the UI, so it can't be bypassed by
+  // calling the API directly.
+  if (req.user.role !== "admin") {
+    const disallowed = operations.some(
+      (op) => op && (op.mode === "delete" || (op.mode === "set" && (op.field === "qtyNew" || op.field === "qtyReturn")))
+    );
+    if (disallowed) return res.status(403).json({ error: "admin only: deleting a SKU or setting an absolute quantity" });
+  }
+
   const store = loadStore();
   let inventory = [];
   try {
@@ -320,7 +333,7 @@ app.post("/api/records/:key/add", requireAuth, (req, res) => {
   res.json({ ok: true, records: arr });
 });
 
-app.post("/api/records/:key/remove", requireAuth, (req, res) => {
+app.post("/api/records/:key/remove", requireAuth, requireAdmin, (req, res) => {
   const key = req.params.key;
   if (!RECORD_KEYS.includes(key)) return res.status(400).json({ error: "invalid key" });
   const { id } = req.body || {};
