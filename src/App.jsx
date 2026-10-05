@@ -615,24 +615,66 @@ function resolveSkus(items, inventory, aliasMap, ignoredSkus = []) {
 // the invoice IS the SKU. The only thing flagged is a SKU that doesn't exist
 // in inventory yet, so the person can consciously confirm it's really new
 // (catches typos) before it silently creates a product line.
-function resolveSkusStrict(items, inventory, ignoredSkus = []) {
+function resolveSkusStrict(items, inventory, ignoredSkus = [], aliasMap = {}, lastPriceOf = () => 0) {
   const ignoredSet = new Set((ignoredSkus || []).map(normalizeSku));
   const invSkus = new Set(inventory.map((x) => normalizeSku(x.sku)));
-  return items
+  const out = [];
+  items
     .filter((it) => !ignoredSet.has(normalizeSku(it.sku)))
-    .map((it) => {
+    .forEach((it, srcIdx) => {
       const raw = String(it.sku || "").trim();
-      const known = invSkus.has(normalizeSku(raw));
-      return {
+      const alias = aliasMap[normalizeSku(raw)];
+      // The one exception to "the invoice SKU is final": a rule explicitly
+      // flagged for purchases (a supplier bundle that is stocked as separate
+      // items). It splits the line, and splits the price so the invoice total
+      // still adds up: components priced "last" use their last purchase price,
+      // the component priced "rest" takes whatever is left of the bundle price.
+      if (alias && alias.purchase) {
+        const comps = aliasComponents(alias);
+        const bundlePrice = Number(it.unitPrice) || 0;
+        const known = comps
+          .filter((c) => c.priceMode !== "rest")
+          .map((c) => ({ c, price: lastPriceOf(c.sku) }));
+        const knownSum = known.reduce((sum, k) => sum + k.price * (Number(k.c.qty) || 1), 0);
+        comps.forEach((c) => {
+          const mult = Number(c.qty) || 1;
+          const isRest = c.priceMode === "rest";
+          const price = isRest ? Math.max(0, (bundlePrice - knownSum) / mult) : lastPriceOf(c.sku);
+          const note = isRest
+            ? `bundle €${bundlePrice.toFixed(2)} − ${known.map((k) => `${k.c.sku} €${(k.price * (Number(k.c.qty) || 1)).toFixed(2)}`).join(" − ") || "€0.00"}`
+            : price > 0
+            ? "last purchase price"
+            : "no earlier purchase found — enter the price";
+          out.push({
+            ...it,
+            sku: c.sku,
+            rawSku: raw,
+            rawQty: it.qty,
+            qty: it.qty * mult,
+            qtyMultiplier: mult,
+            unitPrice: Math.round(price * 100) / 100,
+            priceNote: note,
+            mappedFrom: raw,
+            needsMapping: false,
+            autoMapped: true,
+            _src: srcIdx,
+            isNewSku: !invSkus.has(normalizeSku(c.sku)),
+            newSkuConfirmed: false,
+          });
+        });
+        return;
+      }
+      out.push({
         ...it,
         sku: raw,
         rawQty: it.qty,
         qtyMultiplier: 1,
         needsMapping: false,
-        isNewSku: !known && !!raw,
+        isNewSku: !invSkus.has(normalizeSku(raw)) && !!raw,
         newSkuConfirmed: false,
-      };
+      });
     });
+  return out;
 }
 
 async function extractFromFile(file, mode) {
@@ -1432,6 +1474,7 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
   const [rawInput, setRawInput] = useState("");
   const [components, setComponents] = useState([{ sku: "", qty: 1 }]);
   const [editingKey, setEditingKey] = useState(null);
+  const [purchaseRule, setPurchaseRule] = useState(false);
   const [ruleSearch, setRuleSearch] = useState("");
   const q = normalizeSku(ruleSearch);
   const entries = q
@@ -1443,17 +1486,20 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
   const startEdit = (key, v) => {
     setEditingKey(key);
     setRawInput(v.raw);
-    setComponents(aliasComponents(v).map((c) => ({ sku: c.sku, qty: c.qty })));
+    setComponents(aliasComponents(v).map((c) => ({ sku: c.sku, qty: c.qty, priceMode: c.priceMode || "last" })));
+    setPurchaseRule(!!v.purchase);
     setShowAdd(true);
   };
   const startAdd = () => {
     setEditingKey(null);
+    setPurchaseRule(false);
     setRawInput("");
     setComponents([{ sku: "", qty: 1 }]);
     setShowAdd(true);
   };
   const cancelForm = () => {
     setEditingKey(null);
+    setPurchaseRule(false);
     setRawInput("");
     setComponents([{ sku: "", qty: 1 }]);
     setShowAdd(false);
@@ -1472,24 +1518,39 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
     downloadCSV(rows, `sku-mapping-rules-${todayISO()}.csv`);
   };
 
-  const updateComponent = (ci, field, val) => setComponents(components.map((c, i) => (i === ci ? { ...c, [field]: val } : c)));
+  const updateComponent = (ci, field, val) =>
+    setComponents(
+      components.map((c, i) => {
+        if (i === ci) return { ...c, [field]: val };
+        // Only one component can take "the rest of the bundle price".
+        if (field === "priceMode" && val === "rest" && c.priceMode === "rest") return { ...c, priceMode: "last" };
+        return c;
+      })
+    );
   const addComponent = () => setComponents([...components, { sku: "", qty: 1 }]);
   const removeComponent = (ci) => setComponents(components.filter((_, i) => i !== ci));
 
   const saveRule = async () => {
     const raw = rawInput.trim();
     if (!raw) return;
-    const comps = components.map((c) => ({ sku: String(c.sku || "").trim(), qty: Number(c.qty) || 1 })).filter((c) => c.sku);
+    const comps = components
+      .map((c) => ({
+        sku: String(c.sku || "").trim(),
+        qty: Number(c.qty) || 1,
+        ...(purchaseRule && c.priceMode === "rest" ? { priceMode: "rest" } : {}),
+      }))
+      .filter((c) => c.sku);
     if (comps.length === 0) return;
+    const ruleBody = { raw, components: comps, ...(purchaseRule ? { purchase: true } : {}) };
     const newKey = normalizeSku(raw);
     const desc = comps.map((c) => `${c.sku} ×${c.qty}`).join(", ");
     if (editingKey) {
       // Renaming the raw SKU changes the lookup key — remove the old one first.
       if (editingKey !== newKey) await deleteAlias(editingKey);
-      await setAlias(newKey, { raw, components: comps });
+      await setAlias(newKey, ruleBody);
       logAudit("alias-edit", `Edited SKU mapping rule: "${raw}" → ${desc}`);
     } else {
-      await setAlias(newKey, { raw, components: comps });
+      await setAlias(newKey, ruleBody);
       logAudit("alias-add", `Added SKU mapping rule: "${raw}" → ${desc}`);
     }
     cancelForm();
@@ -1558,7 +1619,10 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
             >
               <div>{v.raw}</div>
               <div style={{ color: C.inkSoft }}>→</div>
-              <div>{aliasComponents(v).map((c) => `${c.sku} ×${c.qty}`).join(", ")}</div>
+              <div>
+                {aliasComponents(v).map((c) => `${c.sku} ×${c.qty}`).join(", ")}
+                {v.purchase && <span style={{ color: C.inventory, fontFamily: FONT_UI, fontSize: 11, marginLeft: 8 }}>· also applies to purchases</span>}
+              </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button onClick={() => startEdit(key, v)} title="Edit rule" style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft, display: "flex" }}>
                   <Pencil size={13} />
@@ -1580,6 +1644,10 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
           <Field label="Raw SKU as it appears on the document">
             <input value={rawInput} onChange={(e) => setRawInput(e.target.value)} style={{ ...inputStyle, fontFamily: FONT_MONO }} placeholder="e.g. SH-MINI1G3" />
           </Field>
+          <label style={{ display: "flex", alignItems: "center", gap: 8, fontSize: 12.5, fontFamily: FONT_UI, color: C.ink, margin: "2px 0 10px", cursor: "pointer" }}>
+            <input type="checkbox" checked={purchaseRule} onChange={(e) => setPurchaseRule(e.target.checked)} />
+            Also apply when uploading a New Stock Purchase invoice (purchases normally ignore rules — use this only for a supplier bundle you stock as separate items)
+          </label>
           <div style={{ fontSize: 12, color: C.inkSoft, marginBottom: 6, fontFamily: FONT_UI, fontWeight: 600 }}>Maps to</div>
           {components.map((c, ci) => (
             <div key={ci} style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 6 }}>
@@ -1598,6 +1666,16 @@ function AliasManager({ aliasMap, saveAliasMap, setAlias, deleteAlias, inventory
                 onChange={(e) => updateComponent(ci, "qty", e.target.value)}
                 style={{ ...inputStyle, padding: "6px 8px", width: 56 }}
               />
+              {purchaseRule && components.length > 1 && (
+                <select
+                  value={c.priceMode === "rest" ? "rest" : "last"}
+                  onChange={(e) => updateComponent(ci, "priceMode", e.target.value)}
+                  style={{ ...inputStyle, padding: "6px 8px", width: 200, fontSize: 12 }}
+                >
+                  <option value="last">Price: its last purchase price</option>
+                  <option value="rest">Price: bundle price minus the others</option>
+                </select>
+              )}
               {components.length > 1 && (
                 <button onClick={() => removeComponent(ci)} style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft }}>
                   <X size={14} />
@@ -2808,8 +2886,9 @@ function ItemsEditor({ items, setItems, showPrice, inventory = [] }) {
                 <span>
                   {it.autoMapped ? "Auto-matched via learned rule: " : "Mapped from: "}
                   {it.rawSku} → {it.sku}
+                  {it.priceNote && <span style={{ color: C.inkSoft }}> · price: {it.priceNote}</span>}
                 </span>
-                {it.autoMapped && (
+                {it.autoMapped && !it.priceNote && (
                   <button
                     onClick={() => revertRule(i)}
                     style={{ border: `1px solid ${C.danger}`, background: "none", color: C.danger, borderRadius: 4, padding: "2px 8px", fontSize: 11, cursor: "pointer", fontFamily: FONT_UI, whiteSpace: "nowrap" }}
@@ -3269,7 +3348,16 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
   // New Stock Purchase: the invoice's SKU is final, never mapped to
   // something else — only flag a SKU inventory doesn't know yet. Return
   // Stock Inbound keeps the full alias/bundle mapping behaviour.
-  const resolve = (items) => (isNew ? resolveSkusStrict(items, inventory, ignoredSkus) : resolveSkus(items, inventory, aliasMap, ignoredSkus));
+  const lastPriceOf = (sku) => {
+    // inboundRecords is newest-first
+    for (const r of inboundRecords) {
+      const hit = (r.items || []).find((x) => normalizeSku(x.sku) === normalizeSku(sku) && Number(x.unitPrice) > 0);
+      if (hit) return Number(hit.unitPrice);
+    }
+    return 0;
+  };
+  const resolve = (items) =>
+    isNew ? resolveSkusStrict(items, inventory, ignoredSkus, aliasMap, lastPriceOf) : resolveSkus(items, inventory, aliasMap, ignoredSkus);
   const accent = isNew ? C.inboundNew : C.inboundReturn;
   const accentSoft = isNew ? C.inboundNewSoft : C.inboundReturnSoft;
   const partyLabel = isNew ? "Supplier" : "Source / returned by";
@@ -3421,13 +3509,17 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
     // Teach the alias table from any rows the person mapped by hand — grouped
     // by mappedFrom so a bundle (one raw SKU → several different components)
     // saves as a single multi-component rule instead of overwriting itself.
+    // Purchases never learn rules (the invoice SKU is final), and rows split
+    // by a purchase-flagged rule must not overwrite that rule's settings.
     const mapGroups = new Map();
-    cleanItems.forEach((it) => {
-      if (!it.mappedFrom) return;
-      const norm = normalizeSku(it.mappedFrom);
-      if (!mapGroups.has(norm)) mapGroups.set(norm, { raw: it.mappedFrom, components: [] });
-      mapGroups.get(norm).components.push({ sku: it.sku.trim(), qty: Number(it.qtyMultiplier) || 1 });
-    });
+    if (!isNew) {
+      cleanItems.forEach((it) => {
+        if (!it.mappedFrom) return;
+        const norm = normalizeSku(it.mappedFrom);
+        if (!mapGroups.has(norm)) mapGroups.set(norm, { raw: it.mappedFrom, components: [] });
+        mapGroups.get(norm).components.push({ sku: it.sku.trim(), qty: Number(it.qtyMultiplier) || 1 });
+      });
+    }
     mapGroups.forEach((val, norm) => {
       const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
