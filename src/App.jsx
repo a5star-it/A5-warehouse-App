@@ -555,8 +555,20 @@ function guessColumn(headers, keywords) {
 // the same item" case) or to SEVERAL different components (a bundle/kit made of
 // different SKUs). Always normalize to a components[] array so downstream code
 // doesn't need to special-case the single-target shape.
+// Drops repeated components (same SKU) — keeps the first occurrence. Repeats
+// used to be written when several rows of the same raw SKU were mapped in one
+// document (one order line each); this also heals rules saved that way.
+function dedupeComponents(list) {
+  const seen = new Set();
+  return (list || []).filter((c) => {
+    const k = normalizeSku(c.sku);
+    if (seen.has(k)) return false;
+    seen.add(k);
+    return true;
+  });
+}
 function aliasComponents(alias) {
-  if (alias.components) return alias.components;
+  if (alias.components) return dedupeComponents(alias.components);
   return [{ sku: alias.sku, qty: Number(alias.qtyMultiplier) || 1 }];
 }
 
@@ -1923,12 +1935,13 @@ function StockCountModal({ inventory, applyInventoryOps, aliasMap, setAlias, ign
       mapGroups.get(norm).components.push({ sku: it.sku, qty: Number(it.qtyMultiplier) || 1 });
     });
     mapGroups.forEach((val, norm) => {
+      val.components = dedupeComponents(val.components);
       const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
         !existing ||
         existing.length !== val.components.length ||
         existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
+      if (changed && !aliasMap[norm]?.purchase) setAlias(norm, { raw: val.raw, components: val.components });
     });
 
     // A SKU can show up more than once — e.g. it's a bundle component AND was
@@ -3521,12 +3534,13 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
       });
     }
     mapGroups.forEach((val, norm) => {
+      val.components = dedupeComponents(val.components);
       const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
         !existing ||
         existing.length !== val.components.length ||
         existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
+      if (changed && !aliasMap[norm]?.purchase) setAlias(norm, { raw: val.raw, components: val.components });
     });
 
     const record = {
@@ -3879,12 +3893,13 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
       mapGroups.get(norm).components.push({ sku: it.sku.trim(), qty: Number(it.qtyMultiplier) || 1 });
     });
     mapGroups.forEach((val, norm) => {
+      val.components = dedupeComponents(val.components);
       const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
         !existing ||
         existing.length !== val.components.length ||
         existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
+      if (changed && !aliasMap[norm]?.purchase) setAlias(norm, { raw: val.raw, components: val.components });
     });
 
     const record = {
@@ -4344,12 +4359,13 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
       mapGroups.get(norm).components.push({ sku: it.sku.trim(), qty: Number(it.qtyMultiplier) || 1 });
     });
     mapGroups.forEach((val, norm) => {
+      val.components = dedupeComponents(val.components);
       const existing = aliasMap[norm] ? aliasComponents(aliasMap[norm]) : null;
       const changed =
         !existing ||
         existing.length !== val.components.length ||
         existing.some((c, idx) => c.sku !== val.components[idx].sku || Number(c.qty) !== Number(val.components[idx].qty));
-      if (changed) setAlias(norm, { raw: val.raw, components: val.components });
+      if (changed && !aliasMap[norm]?.purchase) setAlias(norm, { raw: val.raw, components: val.components });
     });
 
     const record = {
