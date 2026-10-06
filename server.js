@@ -347,6 +347,15 @@ app.post("/api/aliases/set", requireAuth, (req, res) => {
   const { key, value } = req.body || {};
   if (!key || !value) return res.status(400).json({ error: "key and value are required" });
   const obj = loadObjectKey("sku-aliases");
+  if (value && Array.isArray(value.components)) {
+    const seen = new Set();
+    value.components = value.components.filter((c) => {
+      const k = String(c.sku || "").toUpperCase().replace(/[\s\-_./\\]/g, "");
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    });
+  }
   obj[key] = value;
   saveObjectKey("sku-aliases", obj);
   res.json({ ok: true, aliases: obj });
@@ -430,6 +439,25 @@ app.get("*", (req, res) => {
 });
 
 const PORT = process.env.PORT || 3000;
+// Heal alias rules that were saved with repeated components.
+try {
+  const al = loadObjectKey("sku-aliases");
+  let healed = 0;
+  Object.values(al).forEach((v) => {
+    if (v && Array.isArray(v.components)) {
+      const seen = new Set();
+      const out = v.components.filter((c) => {
+        const k = String(c.sku || "").toUpperCase().replace(/[\s\-_./\\]/g, "");
+        if (seen.has(k)) return false;
+        seen.add(k);
+        return true;
+      });
+      if (out.length !== v.components.length) { v.components = out; healed++; }
+    }
+  });
+  if (healed) { saveObjectKey("sku-aliases", al); console.log("Healed duplicate alias components:", healed); }
+} catch (e) { console.error("alias heal failed", e); }
+
 app.listen(PORT, () => {
   console.log(`Warehouse app listening on port ${PORT}`);
   console.log(`Data file: ${DATA_FILE}`);
