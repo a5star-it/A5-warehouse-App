@@ -488,56 +488,60 @@ async function extractPdfText(file) {
 }
 
 function parseAmazonSelfShipPdfText(text) {
+  // Language-independent on purpose: Amazon prints these slips in the buyer's
+  // marketplace language (IT, ES, DE, FR, NL, SV, PL, EN …), so instead of
+  // matching translated labels we rely on things that never change —
+  // the order-ID shape (123-1234567-1234567), the "SKU" label, a standalone
+  // quantity number, and a price with a currency symbol/code.
   const orderIdPattern = /\d{3}-\d{7}-\d{7}/;
-  // Split into one chunk per order. pdf.js gives one continuous text stream,
-  // so each chunk still trails into the next order's shipping-address lines
-  // (which can themselves contain plain numbers like a postal code) — the
-  // "Grazie per aver comprato" footer is used below to cut items off before
-  // that trailing address ever gets scanned.
-  const blocks = text.split(/(?=Numero dell.ordine:)/).filter((b) => orderIdPattern.test(b));
+  const skuLabel = /^(?:(?:merchant|seller)\s+)?SKU(?:[-\s]?(?:nummer|number|numer))?\s*:?$/i;
+  const skuInline = /^(?:(?:merchant|seller)\s+)?SKU(?:[-\s]?(?:nummer|number|numer))?\s*:\s*(\S.*)$/i;
+  const priceLine = /^(?:[€£]\s*\d[\d.,\s]*|\d[\d.,\s]*\s*(?:€|£|EUR|GBP|SEK|PLN|zł|kr|Kč|CZK|DKK|RON|lei)\.?|(?:EUR|GBP|SEK|PLN|CZK|DKK)\s*\d[\d.,\s]*)$/i;
+  const parsePrice = (str) => {
+    const m = str.match(/\d[\d.,\s]*/);
+    if (!m) return 0;
+    let n = m[0].replace(/\s/g, "");
+    const lastComma = n.lastIndexOf(",");
+    const lastDot = n.lastIndexOf(".");
+    if (lastComma > lastDot) n = n.replace(/\./g, "").replace(",", ".");
+    else n = n.replace(/,/g, "");
+    return parseFloat(n) || 0;
+  };
+  // One chunk per order, starting at the line "<label>: 123-1234567-1234567".
+  const blocks = text.split(/(?=^[^\n]{0,60}?\d{3}-\d{7}-\d{7}[ \t]*$)/m).filter((b) => orderIdPattern.test(b.split("\n")[0]));
   const rows = [];
   blocks.forEach((block) => {
     const orderId = block.match(orderIdPattern)[0];
-    const footerIdx = block.search(/Grazie per aver comprato/i);
-    const itemsText = footerIdx >= 0 ? block.slice(0, footerIdx) : block;
-    const lines = itemsText.split("\n").map((l) => l.trim());
-    let started = false;
-    let j = 0;
-    while (j < lines.length) {
-      if (!started) {
-        // Items only start after the "Quantità … Totale ordine" table
-        // header — everything before it (address, order date) is noise.
-        if (lines[j] === "Totale ordine") started = true;
-        j++;
-        continue;
+    const lines = block.split("\n").map((l) => l.trim());
+    // SKU label positions.
+    const skuIdx = [];
+    lines.forEach((l, i) => { if (skuLabel.test(l) || skuInline.test(l)) skuIdx.push(i); });
+    let segStart = 1; // line 0 is the order-ID line itself
+    skuIdx.forEach((si, k) => {
+      const inline = lines[si].match(skuInline);
+      let sku = "";
+      let after = si + 1;
+      if (inline) sku = inline[1].trim();
+      else {
+        while (after < lines.length && !lines[after]) after++;
+        sku = lines[after] || "";
+        after++;
       }
-      // The quantity is the next standalone numeric line. The product title
-      // right after it often starts with a digit too (e.g. "2 Pezzi
-      // Batterie…"), but that's a separate line here, not part of this one.
-      while (j < lines.length && !/^\d+$/.test(lines[j] || "")) j++;
-      if (j >= lines.length) break;
-      const qty = Number(lines[j]);
-      j++;
-      while (j < lines.length && lines[j] !== "SKU:") j++;
-      if (j >= lines.length) break;
-      j++;
-      while (j < lines.length && !lines[j]) j++;
-      const sku = lines[j] || "";
-      j++;
-      while (j < lines.length && !/^N\.\s*prodotto:?$/i.test(lines[j] || "")) j++;
-      if (j >= lines.length) {
-        if (sku && qty > 0) rows.push({ sku, name: "", qty, unitPrice: 0, orderId });
-        break;
+      // Quantity: first standalone small integer since the previous item ended.
+      let qty = 0;
+      for (let q = segStart; q < si; q++) {
+        if (/^\d{1,4}$/.test(lines[q])) { qty = Number(lines[q]); break; }
       }
-      j++;
-      while (j < lines.length && !lines[j]) j++;
-      j++; // the product-number value itself, not needed
-      while (j < lines.length && !lines[j]) j++;
-      const priceMatch = (lines[j] || "").match(/([\d.,]+)\s*€/);
-      const unitPrice = priceMatch ? parseFloat(priceMatch[1].replace(/\./g, "").replace(",", ".")) : 0;
+      // Price: first price-looking line after the SKU, before the next SKU.
+      const limit = k + 1 < skuIdx.length ? skuIdx[k + 1] : lines.length;
+      let unitPrice = 0;
+      let end = after;
+      for (let q = after; q < limit; q++) {
+        if (priceLine.test(lines[q])) { unitPrice = parsePrice(lines[q]); end = q + 1; break; }
+      }
+      segStart = end;
       if (sku && qty > 0) rows.push({ sku, name: "", qty, unitPrice, orderId });
-      j++;
-    }
+    });
   });
   return rows;
 }
