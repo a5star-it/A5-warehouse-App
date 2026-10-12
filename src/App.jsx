@@ -740,7 +740,14 @@ Cover every line item on the document as completely as possible. Do not include 
     notifyAuthExpired();
     throw new Error("session expired");
   }
-  if (!res.ok) throw new Error("AI recognition request failed");
+  if (!res.ok) {
+    let detail = "";
+    try {
+      const body = await res.json();
+      detail = (body && (body.error?.message || body.error)) || "";
+    } catch (e) {}
+    throw new Error("AI recognition request failed" + (detail ? ": " + (typeof detail === "string" ? detail : JSON.stringify(detail)) : ""));
+  }
   const data = await res.json();
   const textBlocks = (data.content || [])
     .filter((b) => b.type === "text")
