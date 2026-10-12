@@ -90,7 +90,8 @@ try {
 function generateToken() {
   return crypto.randomBytes(32).toString("hex");
 }
-const SESSION_DAYS = 30;
+const SESSION_DAYS = 90;
+const DAY_MS = 24 * 60 * 60 * 1000;
 
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -100,6 +101,15 @@ function requireAuth(req, res, next) {
   const session = sessions[token];
   if (!session || new Date(session.expiresAt) < new Date()) {
     return res.status(401).json({ error: "session expired" });
+  }
+  // Sliding expiry: anyone who keeps using the app stays logged in. Only
+  // rewrite the file when at least a day has passed, to avoid a disk write
+  // on every request.
+  const newExpiry = Date.now() + SESSION_DAYS * DAY_MS;
+  if (newExpiry - new Date(session.expiresAt).getTime() > DAY_MS) {
+    session.expiresAt = new Date(newExpiry).toISOString();
+    sessions[token] = session;
+    setSessions(sessions);
   }
   req.user = { username: session.username, role: session.role };
   req.token = token;
@@ -124,7 +134,7 @@ app.post("/api/auth/login", (req, res) => {
   sessions[token] = {
     username: user.username,
     role: user.role,
-    expiresAt: new Date(Date.now() + SESSION_DAYS * 24 * 60 * 60 * 1000).toISOString(),
+    expiresAt: new Date(Date.now() + SESSION_DAYS * DAY_MS).toISOString(),
   };
   setSessions(sessions);
   res.json({ token, username: user.username, role: user.role });
