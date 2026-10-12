@@ -417,6 +417,15 @@ app.post("/api/extract", requireAuth, async (req, res) => {
       body: JSON.stringify({ model, max_tokens, messages }),
     });
     const data = await upstream.json();
+    // Never pass Anthropic's own 401/403 straight through: the browser reads a
+    // 401 as "your login expired" and logs the user out, which hides the real
+    // problem (an invalid, revoked or out-of-credit API key on the server).
+    if (upstream.status === 401 || upstream.status === 403) {
+      console.error("Anthropic API rejected the key:", upstream.status, JSON.stringify(data));
+      return res.status(502).json({
+        error: "The AI service rejected the server's ANTHROPIC_API_KEY (invalid, revoked, or no permission). Check the key in Railway Variables.",
+      });
+    }
     res.status(upstream.status).json(data);
   } catch (e) {
     res.status(500).json({ error: e.message || "extraction request failed" });
