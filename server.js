@@ -239,6 +239,28 @@ app.put("/api/kv/:key", requireAuth, (req, res) => {
    Body: { operations: [{ sku, name?, field: "qtyNew"|"qtyReturn",
            mode: "delta"|"set"|"delete", value? }] }
 ----------------------------------------------------------------- */
+// Sealed multipacks can never account for more units than New Stock holds.
+// If they would, open the smallest packs first (their units become singles).
+function clampPacks(item) {
+  const packs = item.packs && typeof item.packs === "object" ? item.packs : {};
+  const sizes = Object.keys(packs)
+    .map(Number)
+    .filter((n) => n > 1 && Number(packs[n]) > 0)
+    .sort((a, b) => a - b);
+  const qty = Math.max(0, Number(item.qtyNew) || 0);
+  const total = () => sizes.reduce((sum, sz) => sum + sz * (Number(packs[sz]) || 0), 0);
+  let guard = 100000;
+  while (total() > qty && guard-- > 0) {
+    const sz = sizes.find((z) => Number(packs[z]) > 0);
+    if (!sz) break;
+    packs[sz] = Number(packs[sz]) - 1;
+  }
+  const out = {};
+  sizes.forEach((sz) => { if (Number(packs[sz]) > 0) out[String(sz)] = Number(packs[sz]); });
+  if (Object.keys(out).length) item.packs = out;
+  else delete item.packs;
+}
+
 app.post("/api/inventory/adjust", requireAuth, (req, res) => {
   const { operations } = req.body || {};
   if (!Array.isArray(operations)) return res.status(400).json({ error: "operations array required" });
@@ -251,7 +273,7 @@ app.post("/api/inventory/adjust", requireAuth, (req, res) => {
   // calling the API directly.
   if (req.user.role !== "admin") {
     const disallowed = operations.some(
-      (op) => op && (op.mode === "delete" || (op.mode === "set" && (op.field === "qtyNew" || op.field === "qtyReturn")))
+      (op) => op && (op.mode === "delete" || (op.mode === "set" && (op.field === "qtyNew" || op.field === "qtyReturn" || op.field === "packs")))
     );
     if (disallowed) return res.status(403).json({ error: "admin only: deleting a SKU or setting an absolute quantity" });
   }
@@ -274,6 +296,22 @@ app.post("/api/inventory/adjust", requireAuth, (req, res) => {
     }
     if (!op.field) return;
     const cur = map.get(sku) || { sku, name: op.name || sku, qtyNew: 0, qtyReturn: 0 };
+    if (op.field === "packs") {
+      // Intact multipacks kept in New Stock: { "2": 5 } = five 2-packs. The
+      // units are already counted inside qtyNew; this only says how many of
+      // them are still sealed multipacks. Admin-only "set" from the edit form.
+      const clean = {};
+      Object.entries(op.value && typeof op.value === "object" ? op.value : {}).forEach(([size, n]) => {
+        const sz = Math.round(Number(size));
+        const ct = Math.round(Number(n));
+        if (sz > 1 && ct > 0) clean[String(sz)] = ct;
+      });
+      cur.packs = clean;
+      clampPacks(cur);
+      if (op.name && !cur.name) cur.name = op.name;
+      map.set(sku, cur);
+      return;
+    }
     if (op.mode === "delta") {
       cur[op.field] = (Number(cur[op.field]) || 0) + (Number(op.value) || 0);
     } else {
@@ -281,6 +319,24 @@ app.post("/api/inventory/adjust", requireAuth, (req, res) => {
       // fields like brand arrive as strings; forcing everything through
       // Number() here would silently zero out any non-numeric field.
       cur[op.field] = op.value;
+    }
+    if (op.field === "qtyNew") {
+      // Multipack bookkeeping. receive = returned sealed multipacks came in;
+      // ship = an order for the multipack consumes sealed multipacks first;
+      // unreceive = a return record was deleted. Single-unit movements need
+      // no pack op: they use loose singles first, and clampPacks then
+      // "opens" sealed packs only if the loose singles run out.
+      const pk = op.pack;
+      if (pk && Math.round(Number(pk.size)) > 1 && Math.round(Number(pk.count)) > 0) {
+        const key = String(Math.round(Number(pk.size)));
+        const n = Math.round(Number(pk.count));
+        const packs = { ...(cur.packs || {}) };
+        const have = Number(packs[key]) || 0;
+        if (pk.action === "receive") packs[key] = have + n;
+        else if (pk.action === "ship" || pk.action === "unreceive") packs[key] = Math.max(0, have - n);
+        cur.packs = packs;
+      }
+      clampPacks(cur);
     }
     if (op.name && !cur.name) cur.name = op.name;
     map.set(sku, cur);
