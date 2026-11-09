@@ -206,6 +206,52 @@ function skuField(sku) {
   return isUsedSku(sku) ? "qtyReturn" : "qtyNew";
 }
 
+// A row that came from a single-component rule with a multiplier > 1
+// (e.g. "A-2" → A ×2) is a sealed multipack: { size: 2, count: <packs> }.
+// Rows from bundles (one raw SKU → several different SKUs) are not.
+function packOf(it, items, aliasMap) {
+  const mult = Number(it.qtyMultiplier) || 1;
+  if (!it.mappedFrom || mult <= 1 || isUsedSku(it.sku)) return null;
+  const norm = normalizeSku(it.mappedFrom);
+  const alias = aliasMap && aliasMap[norm];
+  if (alias) {
+    if (aliasComponents(alias).length !== 1) return null;
+  } else {
+    const skus = new Set(items.filter((x) => x.mappedFrom && normalizeSku(x.mappedFrom) === norm).map((x) => normalizeSku(x.sku)));
+    if (skus.size !== 1) return null;
+  }
+  const count = Math.round((Number(it.qty) || 0) / mult);
+  return count > 0 ? { size: mult, count } : null;
+}
+// Inventory op for one row, tagged with multipack info when it applies.
+function opWithPack(it, items, aliasMap, sign, action) {
+  const op = { sku: it.sku.trim(), name: it.name, field: skuField(it.sku), mode: "delta", value: sign * (Number(it.qty) || 0) };
+  if (op.field === "qtyNew") {
+    const pk = packOf(it, items, aliasMap);
+    if (pk) op.pack = { ...pk, action };
+  }
+  return op;
+}
+function packSummary(item) {
+  const packs = item.packs || {};
+  const sizes = Object.keys(packs).map(Number).filter((n) => n > 1 && packs[n] > 0).sort((a, b) => a - b);
+  if (!sizes.length) return "";
+  const packUnits = sizes.reduce((sum, sz) => sum + sz * packs[sz], 0);
+  const singles = Math.max(0, (Number(item.qtyNew) || 0) - packUnits);
+  return `${singles} single · ` + sizes.map((sz) => `${packs[sz]} × ${sz}-pack`).join(" · ");
+}
+function packsToText(packs) {
+  return Object.keys(packs || {}).map(Number).sort((a, b) => a - b).map((sz) => `${sz}x${packs[sz]}`).join(", ");
+}
+function parsePacksText(text) {
+  const out = {};
+  String(text || "").split(/[,;\s]+/).forEach((part) => {
+    const m = part.trim().match(/^(\d+)\s*[x×*:]\s*(\d+)$/i);
+    if (m && Number(m[1]) > 1 && Number(m[2]) > 0) out[m[1]] = (out[m[1]] || 0) + Number(m[2]);
+  });
+  return out;
+}
+
 function isSpreadsheetFile(file) {
   const name = (file.name || "").toLowerCase();
   return (
@@ -1178,7 +1224,7 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
     setEditing("new");
   };
   const openEdit = (item) => {
-    setForm({ brand: "", ...item });
+    setForm({ brand: "", ...item, packsText: packsToText(item.packs) });
     setEditing(item.sku);
   };
 
@@ -1212,7 +1258,8 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
     if (isAdmin) {
       ops.push(
         { sku: record.sku, name: record.name, field: "qtyNew", mode: "set", value: record.qtyNew },
-        { sku: record.sku, name: record.name, field: "qtyReturn", mode: "set", value: record.qtyReturn }
+        { sku: record.sku, name: record.name, field: "qtyReturn", mode: "set", value: record.qtyReturn },
+        { sku: record.sku, name: record.name, field: "packs", mode: "set", value: parsePacksText(form.packsText) }
       );
     }
     applyInventoryOps(ops);
@@ -1281,7 +1328,12 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
               </div>
             </div>
             <div style={{ display: "flex", alignItems: "center", gap: 10, flexShrink: 0 }}>
-              <span style={{ fontFamily: FONT_MONO, fontWeight: 700, fontSize: 15, color: x[field] < 0 ? C.danger : C.ink }}>{x[field] || 0}</span>
+              <div style={{ textAlign: "right" }}>
+                <div style={{ fontFamily: FONT_MONO, fontWeight: 700, fontSize: 15, color: x[field] < 0 ? C.danger : C.ink }}>{x[field] || 0}</div>
+                {field === "qtyNew" && packSummary(x) && (
+                  <div style={{ fontFamily: FONT_MONO, fontSize: 11, color: C.inkSoft, whiteSpace: "nowrap" }}>{packSummary(x)}</div>
+                )}
+              </div>
               <button onClick={() => openEdit(x)} style={{ border: "none", background: "none", cursor: "pointer", color: C.inkSoft, display: "flex" }}>
                 <Pencil size={13} />
               </button>
@@ -1423,6 +1475,15 @@ function InventoryView({ setView, inventory, saveInventory, applyInventoryOps, s
               <input type="number" value={form.qtyReturn} disabled={!isAdmin} onChange={(e) => setForm({ ...form, qtyReturn: e.target.value })} style={inputStyle} />
             </Field>
           </div>
+          <Field label="Sealed multipacks inside New qty (e.g. 2x5 = five 2-packs; leave empty for none)">
+            <input
+              value={form.packsText || ""}
+              disabled={!isAdmin}
+              placeholder="2x5, 3x1"
+              onChange={(e) => setForm({ ...form, packsText: e.target.value })}
+              style={inputStyle}
+            />
+          </Field>
           <div style={{ display: "flex", justifyContent: "space-between", marginTop: 16 }}>
             {editing !== "new" && isAdmin ? (
               <Btn color={C.danger} variant="outline" icon={Trash2} onClick={() => { removeItem(editing); setEditing(null); }}>
@@ -3400,7 +3461,9 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
 
   const performDelete = (record) => {
     applyInventoryOps(
-      record.items.map((it) => ({ sku: it.sku, name: it.name, field: skuField(it.sku), mode: "delta", value: -(Number(it.qty) || 0) }))
+      record.items.map((it) => (isNew
+        ? { sku: it.sku, name: it.name, field: skuField(it.sku), mode: "delta", value: -(Number(it.qty) || 0) }
+        : opWithPack({ ...it, sku: String(it.sku) }, record.items, aliasMap, -1, "unreceive")))
     );
     removeInboundRecord(record.id);
     logAudit(
@@ -3521,13 +3584,13 @@ function InboundFlow({ type, inventory, saveInventory, applyInventoryOps, inboun
       return;
     }
     applyInventoryOps(
-      cleanItems.map((it) => ({
+      cleanItems.map((it) => (isNew ? {
         sku: it.sku.trim(),
         name: it.name,
         field: skuField(it.sku),
         mode: "delta",
         value: Number(it.qty) || 0,
-      }))
+      } : opWithPack(it, cleanItems, aliasMap, 1, "receive")))
     );
 
     // Teach the alias table from any rows the person mapped by hand — grouped
@@ -3890,7 +3953,7 @@ function OutboundFbaFlow({ setView, inventory, saveInventory, applyInventoryOps,
     }
     const affectedFields = new Map(cleanItems.map((it) => [it.sku.trim(), skuField(it.sku)]));
     const freshInventory = await applyInventoryOps(
-      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field: skuField(it.sku), mode: "delta", value: -(Number(it.qty) || 0) }))
+      cleanItems.map((it) => opWithPack(it, cleanItems, aliasMap, -1, "ship"))
     );
     const shortage = (freshInventory || []).some(
       (x) => affectedFields.has(x.sku) && Number(x[affectedFields.get(x.sku)]) < 0
@@ -4356,7 +4419,7 @@ function OutboundOrderFlow({ setView, inventory, saveInventory, applyInventoryOp
     }
     const affectedFields = new Map(cleanItems.map((it) => [it.sku.trim(), skuField(it.sku)]));
     const freshInventory = await applyInventoryOps(
-      cleanItems.map((it) => ({ sku: it.sku.trim(), name: it.name, field: skuField(it.sku), mode: "delta", value: -(Number(it.qty) || 0) }))
+      cleanItems.map((it) => opWithPack(it, cleanItems, aliasMap, -1, "ship"))
     );
     const shortage = (freshInventory || []).some(
       (x) => affectedFields.has(x.sku) && Number(x[affectedFields.get(x.sku)]) < 0
